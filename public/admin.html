@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GOT-ID™ Admin Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f3f4f6;
+      color: #111827;
+    }
+    header {
+      background: #1f2937;
+      color: #e5e7eb;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #111827;
+    }
+    header h1 {
+      font-size: 18px;
+      margin: 0;
+    }
+    header span {
+      font-size: 12px;
+      opacity: 0.8;
+    }
+    main {
+      padding: 16px 20px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: 1px solid #1f2937;
+      background: #111827;
+      color: #f9fafb;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    input[type="text"] {
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid #9ca3af;
+      font-size: 13px;
+      min-width: 260px;
+    }
+    .status {
+      font-size: 12px;
+      color: #4b5563;
+      margin-bottom: 4px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #ffffff;
+      font-size: 12px;
+    }
+    thead {
+      background: #e5e7eb;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      white-space: nowrap;
+    }
+    th {
+      font-weight: 600;
+      color: #374151;
+    }
+    tbody tr:nth-child(even) {
+      background: #f9fafb;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill-match {
+      background: #d1fae5;
+      color: #065f46;
+    }
+    .pill-mismatch {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+    .pill-missing {
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .pill-unknown {
+      background: #e5e7eb;
+      color: #374151;
+    }
+    .small {
+      font-size: 11px;
+      color: #6b7280;
+    }
+    .nowrap {
+      white-space: nowrap;
+    }
+    @media (max-width: 900px) {
+      table {
+        font-size: 11px;
+      }
+      th, td {
+        padding: 4px 6px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GOT-ID™ Admin Dashboard</h1>
+      <span>Recent scans (last 100) – internal use only</span>
+    </div>
+    <div class="small" id="header-info"></div>
+  </header>
+
+  <main>
+    <div class="controls">
+      <button id="refresh-btn">Refresh</button>
+      <input
+        type="text"
+        id="token-input"
+        placeholder="Paste Bearer token here (eyJhbGciOi...)"
+      />
+    </div>
+    <div class="status" id="status-text">Idle.</div>
+
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Time (UTC)</th>
+            <th>Result</th>
+            <th>Plate</th>
+            <th>VIN</th>
+            <th>Make / Model / Colour</th>
+            <th>UUID</th>
+            <th>Scanner</th>
+            <th>Officer</th>
+            <th>Signal / Dist</th>
+            <th>GPS</th>
+            <th>Flags</th>
+          </tr>
+        </thead>
+        <tbody id="scans-tbody">
+          <tr><td colspan="12" class="small">No data loaded yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <script>
+    const API_BASE = window.location.origin; // e.g. http://localhost:8080
+    const statusEl = document.getElementById("status-text");
+    const tbody = document.getElementById("scans-tbody");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const tokenInput = document.getElementById("token-input");
+    const headerInfo = document.getElementById("header-info");
+
+    headerInfo.textContent = API_BASE;
+
+    function pillForResult(result) {
+      const r = (result || "UNKNOWN").toUpperCase();
+      let cls = "pill-unknown";
+      if (r === "MATCH") cls = "pill-match";
+      else if (r === "MISMATCH") cls = "pill-mismatch";
+      else if (r === "MISSING") cls = "pill-missing";
+      return '<span class="pill ' + cls + '">' + r + "</span>";
+    }
+
+    function pillFlags(scan) {
+      const parts = [];
+      if (scan.sig_valid === true) parts.push("SIG✓");
+      if (scan.chal_valid === true) parts.push("CHAL✓");
+      if (scan.tamper_flag === true) parts.push("TAMPER");
+      if (scan.flags && scan.flags !== 0) parts.push("F=" + scan.flags);
+      if (parts.length === 0) return "";
+      return '<span class="small">' + parts.join(" · ") + "</span>";
+    }
+
+    async function loadScans() {
+      const token = tokenInput.value.trim();
+      if (!token) {
+        alert("Paste a valid JWT token first (from /v1/auth/login).");
+        return;
+      }
+
+      refreshBtn.disabled = true;
+      statusEl.textContent = "Loading recent scans...";
+
+      try {
+        const res = await fetch(API_BASE + "/v1/scans/recent", {
+          headers: {
+            "Authorization": "Bearer " + token
+          }
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          statusEl.textContent = "Error " + res.status + ": " + text;
+          tbody.innerHTML =
+            '<tr><td colspan="12" class="small">Error loading scans.</td></tr>';
+          refreshBtn.disabled = false;
+          return;
+        }
+
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = "Backend error: " + (data.error || "unknown");
+          tbody.innerHTML =
+            '<tr><td colspan="12" class="small">Backend error.</td></tr>';
+          refreshBtn.disabled = false;
+          return;
+        }
+
+        const scans = data.scans || [];
+        statusEl.textContent = "Loaded " + scans.length + " scan(s).";
+
+        if (scans.length === 0) {
+          tbody.innerHTML =
+            '<tr><td colspan="12" class="small">No scans yet.</td></tr>';
+          refreshBtn.disabled = false;
+          return;
+        }
+
+        tbody.innerHTML = scans
+          .map((s) => {
+            const created = s.created_at || "";
+            const gps =
+              (s.gps_lat != null && s.gps_lon != null)
+                ? s.gps_lat + ", " + s.gps_lon
+                : "";
+            const sig =
+              (s.rssi != null || s.est_distance_m != null)
+                ? (s.rssi != null ? s.rssi + " dBm" : "") +
+                  (s.est_distance_m != null ? " / " + s.est_distance_m + " m" : "")
+                : "";
+
+            return `
+              <tr>
+                <td class="nowrap">${s.id}</td>
+                <td class="nowrap">${created}</td>
+                <td>${pillForResult(s.result)}</td>
+                <td class="nowrap">${s.plate || ""}</td>
+                <td class="nowrap small">${s.vin || ""}</td>
+                <td class="nowrap small">
+                  ${(s.make || "")} ${(s.model || "")}
+                  ${s.colour ? " · " + s.colour : ""}
+                </td>
+                <td class="nowrap small">${s.uuid || ""}</td>
+                <td class="nowrap small">${s.scanner_id || ""}</td>
+                <td class="nowrap small">${s.officer_id || ""}</td>
+                <td class="nowrap small">${sig}</td>
+                <td class="nowrap small">${gps}</td>
+                <td>${pillFlags(s)}</td>
+              </tr>
+            `;
+          })
+          .join("");
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Error loading scans (network / JS error).";
+        tbody.innerHTML =
+          '<tr><td colspan="12" class="small">Network / JS error.</td></tr>';
+      }
+
+      refreshBtn.disabled = false;
+    }
+
+    refreshBtn.addEventListener("click", loadScans);
+  </script>
+</body>
+</html>
