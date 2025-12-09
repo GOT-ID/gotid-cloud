@@ -1,14 +1,16 @@
 -- 002_scans_table.sql
--- Table to store GOT-ID scanner BLE scan events
+-- Create table to store GOT-ID scanner events
 
 CREATE TABLE IF NOT EXISTS scans (
-    id              SERIAL PRIMARY KEY,
-    scanner_id      TEXT,           -- e.g. "COM5" or scanner UUID
-    uuid            TEXT,           -- GOT-ID broadcaster UUID
-    plate           TEXT,           -- licence plate recognised / expected
-    vin             TEXT,           -- optional VIN
-    result          TEXT,           -- MATCH / MISMATCH / MISSING / ERROR
-    rssi            INTEGER,        -- signal strength if we capture it
-    raw_json        JSONB,          -- full payload from scanner (for forensics)
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id SERIAL PRIMARY KEY,
+  uuid TEXT NOT NULL,
+  counter INTEGER,
+  signature_valid BOOLEAN,
+  match_result TEXT,
+  plate TEXT,
+  vin TEXT,
+  make TEXT,
+  model TEXT,
+  raw_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
