@@ -48,24 +48,34 @@ app.use((req, res) => {
 });
 
 // ----------------------------------------------
+/ ----------------------------------------------
 // SERVER START
 // ----------------------------------------------
 const port = process.env.PORT || 8080;
-// --- TEST SCAN ENDPOINT (for Daniel's sanity check) ---
-app.use(express.json());
 
-app.post('/api/test-scan', (req, res) => {
-  console.log('TEST SCAN PAYLOAD:', req.body);
+// --- TEST SCAN ENDPOINT (for Daniel's sanity check) ---
+// NOTE: we already did app.use(express.json({ limit: "1mb" })) above,
+// so we do NOT need another app.use(express.json()) here.
+app.post("/api/test-scan", (req, res) => {
+  console.log("TEST SCAN PAYLOAD:", req.body);
 
   // In future we'll insert into Postgres here.
   res.json({
     ok: true,
-    message: 'Test scan received on GOT-ID Cloud',
-    received: req.body
+    message: "Test scan received on GOT-ID Cloud",
+    received: req.body,
   });
 });
+
+// ----------------------------------------------
+// 404 FALLBACK (THIS MUST STAY LAST!)
+// ----------------------------------------------
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "not_found" });
+});
+
 // -------------------------------------------------------
 app.listen(port, () => {
   console.log(`GOT-ID Cloud running on http://localhost:${port}`);
-
 });
+
