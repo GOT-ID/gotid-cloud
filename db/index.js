@@ -1,19 +1,13 @@
 // db/index.js
-// GOT-ID Cloud – Postgres connection
+// GOT-ID Cloud — Postgres helper
 
-import pg from 'pg';
+import pool from "./pool.js";
 
-const { Pool } = pg;
-
-// Use the DATABASE_URL from your .env file
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-// Simple helper for running queries
-export async function query(text, params) {
-  return pool.query(text, params);
+// Simple wrapper for running SQL queries
+export async function runQuery(text, params = []) {
+  const result = await pool.query(text, params);
+  return result.rows;      // Always return only the rows
 }
 
-// Export the pool itself if we ever need it directly
+// Export pool in case we ever need raw access
 export { pool };
