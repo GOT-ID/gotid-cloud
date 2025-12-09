@@ -1,19 +1,27 @@
-import anprRoute from "./routes/v1/anpr.js";
+// server.js — GOT-ID Cloud API
+
 import "dotenv/config";
 import express from "express";
-import healthRoute from "./routes/health.js";
-import scansRoute from "./routes/v1/scans.js";
-import authRoute from "./routes/v1/auth.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
+import healthRoute from "./routes/health.js";
+import scansRoute from "./routes/v1/scans.js";
+import authRoute from "./routes/v1/auth.js";
+import anprRoute from "./routes/v1/anpr.js";
+
+// ----------------------------------------------
+// PATH / APP SETUP
+// ----------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
+
 const app = express();
 
 // Parse JSON bodies up to 1MB (for forensic scan payloads)
 app.use(express.json({ limit: "1mb" }));
-// serve static admin dashboard files
+
+// Serve static admin dashboard files
 app.use(express.static(path.join(__dirname, "public")));
 
 // ----------------------------------------------
@@ -27,7 +35,9 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "/health",
       scans: "/v1/scans",
-      auth_login: "/v1/auth/login"   // once we add this route
+      auth_login: "/v1/auth/login", // once we add this route
+      anpr: "/v1/anpr",
+      test_scan: "/api/test-scan"
     }
   });
 });
@@ -41,21 +51,8 @@ app.use("/v1/auth", authRoute);
 app.use("/v1/anpr", anprRoute);
 
 // ----------------------------------------------
-// 404 FALLBACK
+// TEST SCAN ENDPOINT (for Daniel's sanity check)
 // ----------------------------------------------
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "not_found" });
-});
-
-// ----------------------------------------------
-/ ----------------------------------------------
-// SERVER START
-// ----------------------------------------------
-const port = process.env.PORT || 8080;
-
-// --- TEST SCAN ENDPOINT (for Daniel's sanity check) ---
-// NOTE: we already did app.use(express.json({ limit: "1mb" })) above,
-// so we do NOT need another app.use(express.json()) here.
 app.post("/api/test-scan", (req, res) => {
   console.log("TEST SCAN PAYLOAD:", req.body);
 
@@ -63,18 +60,22 @@ app.post("/api/test-scan", (req, res) => {
   res.json({
     ok: true,
     message: "Test scan received on GOT-ID Cloud",
-    received: req.body,
+    received: req.body
   });
 });
 
 // ----------------------------------------------
-// 404 FALLBACK (THIS MUST STAY LAST!)
+// 404 FALLBACK  (KEEP THIS LAST)
 // ----------------------------------------------
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "not_found" });
 });
 
-// -------------------------------------------------------
+// ----------------------------------------------
+// SERVER START
+// ----------------------------------------------
+const port = process.env.PORT || 8080;
+
 app.listen(port, () => {
   console.log(`GOT-ID Cloud running on http://localhost:${port}`);
 });
