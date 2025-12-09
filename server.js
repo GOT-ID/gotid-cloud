@@ -10,13 +10,94 @@ import scansRoute from "./routes/v1/scans.js";
 import authRoute from "./routes/v1/auth.js";
 import anprRoute from "./routes/v1/anpr.js";
 
+// DB helper (same query() you already use in routes/v1/scans.js)
+import { query } from "./db/index.js";
+
 // ----------------------------------------------
 // PATH SETUP (so we can serve /public, etc.)
 // ----------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
 
+// ----------------------------------------------
+// DB SCHEMA INITIALISATION (RUNS ON STARTUP)
+// ----------------------------------------------
+async function ensureSchema() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS scan_events (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ver INTEGER NOT NULL,
+      flags INTEGER NOT NULL,
+      uuid TEXT,
+      counter INTEGER,
+      sig_valid BOOLEAN,
+      chal_valid BOOLEAN,
+      tamper_flag BOOLEAN,
+      result TEXT,
+      plate TEXT,
+      vin TEXT,
+      make TEXT,
+      model TEXT,
+      colour TEXT,
+      rssi INTEGER,
+      est_distance_m NUMERIC,
+      gps_lat NUMERIC,
+      gps_lon NUMERIC,
+      scanner_id TEXT,
+      officer_id TEXT,
+      raw_json JSONB
+    );
+
+    CREATE TABLE IF NOT EXISTS fusion_events (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      plate TEXT,
+      scan_id INTEGER REFERENCES scan_events(id) ON DELETE CASCADE,
+      fusion_verdict TEXT,
+      final_label TEXT,
+      visual_confidence NUMERIC,
+      has_gotid BOOLEAN,
+      registry_status TEXT,
+      reasons JSONB,
+      raw_json JSONB
+    );
+
+    CREATE TABLE IF NOT EXISTS anpr_events (
+      id SERIAL PRIMARY KEY,
+      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      plate TEXT NOT NULL,
+      camera_id TEXT,
+      confidence NUMERIC,
+      raw_json JSONB
+    );
+
+    CREATE TABLE IF NOT EXISTS vehicles (
+      id SERIAL PRIMARY KEY,
+      plate TEXT UNIQUE NOT NULL,
+      vin TEXT,
+      make TEXT,
+      model TEXT,
+      colour TEXT,
+      gotid_uuid TEXT,
+      public_key TEXT,
+      status TEXT,
+      raw_json JSONB
+    );
+  `;
+
+  try {
+    await query(sql);
+    console.log("✅ GOT-ID DB schema is ready.");
+  } catch (err) {
+    console.error("❌ GOT-ID DB schema init failed:", err);
+  }
+}
+
 const app = express();
+
+// kick off DB schema init (safe to run every deploy)
+ensureSchema();
 
 // ----------------------------------------------
 // GLOBAL MIDDLEWARE
@@ -42,9 +123,9 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "/health",
       scans: "/v1/scans",
-      auth_login: "/v1/auth/login", // once we add this route fully
+      auth_login: "/v1/auth/login",
       anpr_ingest: "/v1/anpr",
-      test_scan: "/api/test-scan"   // DEV: scanner → cloud sanity check
+      test_scan: "/api/test-scan" // DEV: scanner → cloud sanity check
     }
   });
 });
@@ -66,11 +147,9 @@ app.use("/v1/anpr", anprRoute);
 // DEV / DIAGNOSTIC ENDPOINT (KEEP FOR NOW)
 // ----------------------------------------------
 // This is your direct scanner → cloud sanity-check endpoint.
-// We’ll remove it later once /v1/scans is 100% production-ready.
 app.post("/api/test-scan", (req, res) => {
   console.log("TEST SCAN PAYLOAD:", req.body);
 
-  // In future we’ll insert into Postgres here (or call scansRoute logic).
   res.json({
     ok: true,
     message: "Test scan received on GOT-ID Cloud",
@@ -96,4 +175,3 @@ app.listen(port, () => {
 
 // (Optional export, in case we ever want to import app in tests)
 export default app;
-
