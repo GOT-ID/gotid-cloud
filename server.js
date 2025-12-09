@@ -51,6 +51,21 @@ app.use((req, res) => {
 // SERVER START
 // ----------------------------------------------
 const port = process.env.PORT || 8080;
+// --- TEST SCAN ENDPOINT (for Daniel's sanity check) ---
+app.use(express.json());
+
+app.post('/api/test-scan', (req, res) => {
+  console.log('TEST SCAN PAYLOAD:', req.body);
+
+  // In future we'll insert into Postgres here.
+  res.json({
+    ok: true,
+    message: 'Test scan received on GOT-ID Cloud',
+    received: req.body
+  });
+});
+// -------------------------------------------------------
 app.listen(port, () => {
   console.log(`GOT-ID Cloud running on http://localhost:${port}`);
+
 });
