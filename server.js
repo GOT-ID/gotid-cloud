@@ -1,6 +1,7 @@
 // server.js
 import "dotenv/config";
 import express from "express";
+import cors from "cors";               // ✅ NEW: CORS
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -102,6 +103,9 @@ ensureSchema();
 // ----------------------------------------------
 // GLOBAL MIDDLEWARE
 // ----------------------------------------------
+
+// ✅ Allow cross-origin requests (browser / tools)
+app.use(cors());
 
 // Parse JSON bodies up to 1MB (for forensic scan payloads)
 app.use(express.json({ limit: "1mb" }));
