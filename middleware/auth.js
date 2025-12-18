@@ -1,14 +1,20 @@
 // middleware/auth.js
-import jwt from "jsonwebtoken";
 
-// Simple bearer-token auth.
+// Simple bearer-token auth for machine clients (scanner, ANPR, etc.).
 // In dev you can bypass with DEV_ALLOW_NO_TOKEN=true
-export function requireAuth(req, res, next) {
-  if (process.env.DEV_ALLOW_NO_TOKEN === "true") return next();
 
-  if (!process.env.JWT_SECRET) {
-    console.error("JWT_SECRET missing in environment");
-    return res.status(500).json({ ok: false, error: "server_misconfigured" });
+export function requireAuth(req, res, next) {
+  // Optional dev bypass
+  if (process.env.DEV_ALLOW_NO_TOKEN === "true") {
+    return next();
+  }
+
+  const expected = process.env.API_TOKEN;
+  if (!expected) {
+    console.error("API_TOKEN missing in environment");
+    return res
+      .status(500)
+      .json({ ok: false, error: "server_misconfigured_no_api_token" });
   }
 
   const header = req.headers.authorization || "";
@@ -18,13 +24,11 @@ export function requireAuth(req, res, next) {
     return res.status(401).json({ ok: false, error: "missing_token" });
   }
 
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch (e) {
-    // more explicit errors help real-world debugging
-    const code = e?.name === "TokenExpiredError" ? "token_expired" : "invalid_token";
-    return res.status(401).json({ ok: false, error: code });
+  if (token !== expected) {
+    return res.status(401).json({ ok: false, error: "invalid_token" });
   }
+
+  // You can attach a simple "user" if you want for logging
+  req.user = { role: "scanner", auth: "api_token" };
+  next();
 }
