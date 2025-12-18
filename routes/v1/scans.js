@@ -1,4 +1,3 @@
-// routes/v1/scans.js
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth.js";
 import { query } from "../../db/index.js";
@@ -37,13 +36,8 @@ Body example (scanner -> cloud):
 router.post("/", requireAuth, async (req, res) => {
   const body = req.body || {};
 
-  // Safely build JSON payloads for JSONB columns
-  const scanRawJson = JSON.stringify(body.raw_json || body || {});
-  // Fusion raw_json will store the whole fusion decision object later
-  let fusionRawJson = null;
-
   try {
-    // 1) Insert into scan_events
+    // 1) Insert into your existing scan_events table (same as before)
     const sql = `
       INSERT INTO scan_events (
         ver,
@@ -87,7 +81,7 @@ router.post("/", requireAuth, async (req, res) => {
         $15,                         -- gps_lon
         $16,                         -- scanner_id
         $17,                         -- officer_id
-        $18::jsonb                   -- raw_json (cast from JSON text)
+        $18                          -- raw_json
       )
       RETURNING id, created_at;
     `;
@@ -110,7 +104,7 @@ router.post("/", requireAuth, async (req, res) => {
       body.gps_lon ?? null,
       body.scanner_id || null,
       body.officer_id || null,
-      scanRawJson
+      body.raw_json || {}
     ];
 
     const result = await query(sql, params);
@@ -175,7 +169,7 @@ router.post("/", requireAuth, async (req, res) => {
         counter: body.counter ?? 0,
         sig_valid: body.sig_valid ?? true,
         chal_valid: body.chal_valid ?? true,
-        pubkey_match: body.pubkey_match ?? true,
+        pubkey_match: body.pubkey_match ?? true,   // not stored, but we can pass from body
         tamper: body.tamper ?? body.tamper_flag ?? false,
         rssi: body.rssi ?? null,
         est_distance_m: body.est_distance_m ?? null
@@ -184,8 +178,6 @@ router.post("/", requireAuth, async (req, res) => {
       aiEvent: null,        // we’ll add AI later
       lastCounter
     });
-
-    fusionRawJson = JSON.stringify(fusion || {});
 
     // 6) Store fusion result into fusion_events
     const fusionSql = `
@@ -200,7 +192,7 @@ router.post("/", requireAuth, async (req, res) => {
         reasons,
         raw_json
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       RETURNING id, created_at;
     `;
 
@@ -213,13 +205,13 @@ router.post("/", requireAuth, async (req, res) => {
       fusion.has_gotid,
       fusion.registry_status,
       fusion.reasons,
-      fusionRawJson
+      fusion
     ]);
 
     const fusionId = fusionRes.rows[0].id;
 
     // 7) Response back to caller (scanner, tools, etc.)
-    return res.status(201).json({
+    res.json({
       ok: true,
       id: row.id,
       created_at: row.created_at,
@@ -231,7 +223,7 @@ router.post("/", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("scan insert / fusion error:", err);
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
       error: "DB insert or fusion error"
     });
@@ -272,13 +264,13 @@ router.get("/recent", requireAuth, async (req, res) => {
       LIMIT 100;
     `;
     const result = await query(sql);
-    return res.json({
+    res.json({
       ok: true,
       scans: result.rows
     });
   } catch (err) {
     console.error("scan recent error:", err);
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
       error: "DB query error"
     });
