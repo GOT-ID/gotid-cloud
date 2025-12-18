@@ -1,38 +1,22 @@
 // routes/v1/auth.js
-import express from "express";
-import jwt from "jsonwebtoken";
+import { Router } from "express";
+import { requireAuth } from "../../middleware/auth.js";
 
-const router = express.Router();
+const router = Router();
 
-// DEV login endpoint to mint JWTs for scanners/officers.
-// Later we’ll replace this with real officer accounts + hashed passwords.
-router.post("/login", (req, res) => {
-  const { officer_id, scanner_id } = req.body;
-
-  if (!officer_id && !scanner_id) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing_identity",
-      help: "send officer_id or scanner_id"
-    });
-  }
-
-  if (!process.env.JWT_SECRET) {
-    console.error("JWT_SECRET missing in .env");
-    return res.status(500).json({ ok: false, error: "server_misconfigured" });
-  }
-
-  const token = jwt.sign(
-    {
-      officer_id: officer_id || null,
-      scanner_id: scanner_id || null,
-      role: officer_id ? "officer" : "scanner",
-    },
-    process.env.JWT_SECRET,
-    { expiresIn: "12h" }
-  );
-
-  res.json({ ok: true, token });
+/**
+ * GET /v1/auth/status
+ *
+ * - Protected by requireAuth (must send correct Bearer token)
+ * - Lets you test that API_TOKEN + middleware are working
+ *   without involving the scanner.
+ */
+router.get("/status", requireAuth, (req, res) => {
+  res.json({
+    ok: true,
+    message: "GOT-ID auth is working",
+    scanner: req.scanner || null,  // set in middleware
+  });
 });
 
 export default router;
