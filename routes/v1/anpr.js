@@ -3,7 +3,7 @@
 
 import { Router } from "express";
 import { requireAuth } from "../../middleware/auth.js";
-import { query } from "../../db/index.js";
+import { runQuery } from "../../db/index.js";   // <— use runQuery from db/index.js
 
 const router = Router();
 
@@ -55,8 +55,9 @@ router.post("/", requireAuth, async (req, res) => {
       raw || req.body
     ];
 
-    const result = await query(sql, params);
-    const row = result.rows[0];
+    // Use runQuery helper (returns rows array)
+    const rows = await runQuery(sql, params);
+    const row = rows[0];
 
     console.log("[ANPR] inserted:", row);
 
