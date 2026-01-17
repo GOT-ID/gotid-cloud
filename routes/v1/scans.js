@@ -82,14 +82,14 @@ router.post("/", requireAuth, async (req, res) => {
     const uuid = asStr(body.uuid, MAX_UUID_LEN, null);
     const counter = clampInt(body.counter ?? 0, 0, 2_000_000_000, 0);
 
-    const sig_valid_in = asBool(body.sig_valid, true);
-    const chal_valid_in = asBool(body.chal_valid, true);
+    const sig_valid = asBool(body.sig_valid, true);
+    const chal_valid = asBool(body.chal_valid, true);
     const tamper_flag = asBool(body.tamper ?? body.tamper_flag, false);
 
     const rssi =
       body.rssi === undefined || body.rssi === null
         ? null
-        : clampInt(body.rssi, -120, 20, -60);
+        : clampInt(Number(body.rssi), -120, 20, -60);
 
     const est_distance_m =
       body.est_distance_m === undefined || body.est_distance_m === null
@@ -124,12 +124,11 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
-    // Police-grade truth: if no identity captured, crypto cannot be "passed"
+    // Identity is ONLY "present" if we captured pubkey_hex (tag identity proof)
     const has_identity = !!observedPubkeyHex;
-    const sig_valid = has_identity ? sig_valid_in : false;
-    const chal_valid = has_identity ? chal_valid_in : false;
 
     // ---- 1) Insert scan_events (forensic record) ----
+    // (We store exactly what scanner sent. Fusion may treat "missing identity" differently.)
     const insertSql = `
       INSERT INTO scan_events (
         ver,
@@ -201,25 +200,22 @@ router.post("/", requireAuth, async (req, res) => {
 
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
-
-    // Use scan time as fusion anchor
     const scanTsSec = Math.floor(new Date(scanRow.created_at).getTime() / 1000);
 
-    // ---- 2) Cloud Master Authority lookup (pubkey-first + UUID_MISSING + KEY_MISMATCH) ----
+    // ---- 2) Cloud Master Authority lookup (pubkey-first + KEY_MISMATCH + UUID_MISSING) ----
     const reasonsCloud = [];
     let registryVehicle = null;
     let cloud_verdict = "UUID_MISSING";
     let cloud_action = "INVESTIGATE";
 
-    // 2A) If NO pubkey captured: check if plate is enrolled (UUID_MISSING vs UNREGISTERED_VEHICLE)
-    if (!observedPubkeyHex) {
+    if (!has_identity) {
       reasonsCloud.push("No pubkey_hex provided by scanner (tag missing / not captured).");
 
+      // If we have a plate, check if it’s enrolled (police-grade: enrolled-but-missing-tag)
       if (observedPlate) {
-        const pRes = await query(
-          "SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;",
-          [observedPlate]
-        );
+        const pRes = await query("SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;", [
+          observedPlate
+        ]);
 
         if (pRes.rows.length) {
           registryVehicle = pRes.rows[0];
@@ -236,7 +232,6 @@ router.post("/", requireAuth, async (req, res) => {
         cloud_action = "INVESTIGATE";
       }
     } else {
-      // 2B) Pubkey present -> validate + look up identity
       const keys = pubkeyCandidates(observedPubkeyHex);
 
       if (!keys.length) {
@@ -247,10 +242,7 @@ router.post("/", requireAuth, async (req, res) => {
         let v = null;
 
         for (const k of keys) {
-          const vRes = await query(
-            "SELECT * FROM vehicles WHERE public_key = $1 LIMIT 1;",
-            [k]
-          );
+          const vRes = await query("SELECT * FROM vehicles WHERE public_key = $1 LIMIT 1;", [k]);
           if (vRes.rows.length) {
             v = vRes.rows[0];
             break;
@@ -258,12 +250,11 @@ router.post("/", requireAuth, async (req, res) => {
         }
 
         if (!v) {
-          // If plate exists in registry but pubkey doesn't -> KEY_MISMATCH (clone suspected)
+          // If plate exists but pubkey not enrolled -> KEY_MISMATCH (suspected clone)
           if (observedPlate) {
-            const pRes = await query(
-              "SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;",
-              [observedPlate]
-            );
+            const pRes = await query("SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;", [
+              observedPlate
+            ]);
 
             if (pRes.rows.length) {
               registryVehicle = pRes.rows[0];
@@ -358,22 +349,25 @@ router.post("/", requireAuth, async (req, res) => {
       lastCounter = cRes.rows[0]?.counter ?? null;
     }
 
-    // ---- 6) Run fusion brain (police-grade inputs) ----
+    // ---- 6) Run fusion brain (IMPORTANT: no identity => scanEvent=null for fusion) ----
+    const scanEventForFusion = has_identity
+      ? {
+          plate: observedPlate || null,
+          uuid: uuid || null,
+          counter,
+          sig_valid,
+          chal_valid,
+          pubkey_match: body.pubkey_match ?? null,
+          tamper: tamper_flag,
+          rssi,
+          est_distance_m,
+          cloud_verdict
+        }
+      : null;
+
     const fusion = decideFusion({
       registryVehicle,
-      scanEvent: {
-        plate: observedPlate || null,
-        uuid: uuid || null,
-        counter,
-        sig_valid,
-        chal_valid,
-        pubkey_match: body.pubkey_match ?? null,
-        tamper: tamper_flag,
-        rssi,
-        est_distance_m,
-        cloud_verdict,
-        has_identity
-      },
+      scanEvent: scanEventForFusion,
       anprEvent,
       aiEvent,
       lastCounter
@@ -465,10 +459,7 @@ router.post("/", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("scan insert / fusion error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "DB insert or fusion error"
-    });
+    res.status(500).json({ ok: false, error: "DB insert or fusion error" });
   }
 });
 
