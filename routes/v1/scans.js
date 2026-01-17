@@ -3,41 +3,35 @@ import { requireAuth } from "../../middleware/auth.js";
 import { query } from "../../db/index.js";
 import { decideFusion } from "../../fusion.js";
 
-const router = Router();
-
-/*
-POST /v1/scans
-
-Body example (scanner -> cloud):
-
-{
-  "uuid": "TEST-UUID-123",
-  "plate": "AB12CDE",
-  "vin": "VIN123456789",
-  "make": "Ford",
-  "model": "Fiesta",
-  "colour": "Blue",
-  "counter": 412,
-  "sig_valid": true,
-  "chal_valid": true,
-  "pubkey_match": true,
-  "tamper": false,
-  "rssi": -55,
-  "est_distance_m": 3.2,
-  "gps_lat": 51.5,
-  "gps_lon": -0.1,
-  "scanner_id": "SCN-001",
-  "officer_id": "OFF-001",
-  "result": "MATCH",
-  "raw_json": { "source": "cloud-test" }
+/* ---------- helpers ---------- */
+function normPlate(p) {
+  return (p || "").toUpperCase().replace(/\s+/g, "");
 }
-*/
+function normHex(h) {
+  return (h || "").toUpperCase().replace(/\s+/g, "");
+}
+function isHex(s) {
+  return /^[0-9A-F]*$/.test(s);
+}
+// Accept pubkeys with or without "04" prefix.
+function pubkeyCandidates(pubkeyHex) {
+  const k = normHex(pubkeyHex);
+  if (!k) return [];
+  if (!isHex(k)) return [];
+  if (k.startsWith("04")) return [k, k.slice(2)];
+  return [k, "04" + k];
+}
+function normStatus(s) {
+  return (s || "").toUpperCase().trim();
+}
+
+const router = Router();
 
 router.post("/", requireAuth, async (req, res) => {
   const body = req.body || {};
 
   try {
-    // 1) Insert into your existing scan_events table (same as before)
+    // 1) Insert scan_events (this is the forensic record)
     const sql = `
       INSERT INTO scan_events (
         ver,
@@ -62,32 +56,32 @@ router.post("/", requireAuth, async (req, res) => {
         raw_json
       )
       VALUES (
-        1,                           -- ver
-        0,                           -- flags
-        $1,                          -- uuid
-        COALESCE($2, 0),             -- counter
-        COALESCE($3, true),          -- sig_valid
-        COALESCE($4, true),          -- chal_valid
-        COALESCE($5, false),         -- tamper_flag
-        $6,                          -- result
-        $7,                          -- plate
-        $8,                          -- vin
-        $9,                          -- make
-        $10,                         -- model
-        $11,                         -- colour
-        $12,                         -- rssi
-        $13,                         -- est_distance_m
-        $14,                         -- gps_lat
-        $15,                         -- gps_lon
-        $16,                         -- scanner_id
-        $17,                         -- officer_id
-        $18                          -- raw_json
+        1,
+        0,
+        $1,
+        COALESCE($2, 0),
+        COALESCE($3, true),
+        COALESCE($4, true),
+        COALESCE($5, false),
+        $6,
+        $7,
+        $8,
+        $9,
+        $10,
+        $11,
+        $12,
+        $13,
+        $14,
+        $15,
+        $16,
+        $17,
+        $18
       )
       RETURNING id, created_at;
     `;
 
     const params = [
-      body.uuid,
+      body.uuid || null,
       body.counter ?? 0,
       body.sig_valid ?? true,
       body.chal_valid ?? true,
@@ -107,28 +101,76 @@ router.post("/", requireAuth, async (req, res) => {
       body.raw_json || {}
     ];
 
-    const result = await query(sql, params);
-    const row = result.rows[0];
+    const insertRes = await query(sql, params);
+    const row = insertRes.rows[0];
 
-    console.log("scan inserted:", row);
+    // Use scan time as fusion anchor
+    const scanTsSec = Math.floor(new Date(row.created_at).getTime() / 1000);
 
-    // --------- NEW: fusion logic ---------
+    // --------- Cloud Master Authority lookup (by pubkey, not plate) ---------
+    const reasonsCloud = [];
+    const observedPlate = normPlate(body.plate || "");
+    const observedPubkeyHex = normHex(body.raw_json?.pubkey_hex || body.pubkey_hex || "");
 
-    // 2) Look up vehicle in registry (if plate known)
-    let registryVehicle = null;
-    if (body.plate) {
-      const vRes = await query(
-        "SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;",
-        [body.plate]
-      );
-      registryVehicle = vRes.rows[0] || null;
+    let registryVehicle = null; // authoritative registry record
+    let cloud_verdict = "UUID_MISSING";
+    let cloud_action = "INVESTIGATE";
+
+    if (!observedPubkeyHex) {
+      reasonsCloud.push("No pubkey_hex provided by scanner (tag missing / not captured).");
+    } else {
+      const keys = pubkeyCandidates(observedPubkeyHex);
+
+      if (!keys.length) {
+        cloud_verdict = "INVALID_IDENTITY";
+        cloud_action = "STOP_INVESTIGATE";
+        reasonsCloud.push("pubkey_hex malformed (non-hex).");
+      } else {
+        let v = null;
+
+        // Try both forms (with/without 04 prefix)
+        for (const k of keys) {
+          const vRes = await query(
+            "SELECT * FROM vehicles WHERE public_key = $1 LIMIT 1;",
+            [k]
+          );
+          if (vRes.rows.length) {
+            v = vRes.rows[0];
+            break;
+          }
+        }
+
+        if (!v) {
+          cloud_verdict = "UNREGISTERED_IDENTITY";
+          cloud_action = "INVESTIGATE";
+          reasonsCloud.push("Identity not enrolled in cloud registry.");
+        } else {
+          registryVehicle = v;
+
+          const st = normStatus(v.status);
+          if (st && st !== "ACTIVE") {
+            cloud_verdict = "REVOKED_VEHICLE";
+            cloud_action = "STOP";
+            reasonsCloud.push(`Registry status=${st}`);
+          } else {
+            const assignedPlate = normPlate(v.plate);
+            if (observedPlate && assignedPlate && observedPlate !== assignedPlate) {
+              cloud_verdict = "MISMATCH";
+              cloud_action = "STOP";
+              reasonsCloud.push(`Plate mismatch observed=${observedPlate} assigned=${assignedPlate}`);
+            } else {
+              cloud_verdict = "AUTHENTIC";
+              cloud_action = "NONE";
+              reasonsCloud.push("Identity enrolled + ACTIVE; plate consistent.");
+            }
+          }
+        }
+      }
     }
 
-    // 3) Find ANPR event within ±10 seconds of this scan
+    // 3) Find nearest ANPR event within ±10 seconds
     let anprEvent = null;
-    if (body.plate) {
-      const scanTsSec = Math.floor(new Date(row.created_at).getTime() / 1000);
-
+    if (observedPlate) {
       const anprRes = await query(
         `
         SELECT *
@@ -139,12 +181,30 @@ router.post("/", requireAuth, async (req, res) => {
         ORDER BY ts DESC
         LIMIT 1;
         `,
-        [body.plate, scanTsSec]
+        [observedPlate, scanTsSec]
       );
       anprEvent = anprRes.rows[0] || null;
     }
 
-    // 4) Previous counter for this UUID (replay detection)
+    // 4) Find nearest AI event within ±10 seconds
+    let aiEvent = null;
+    if (observedPlate) {
+      const aiRes = await query(
+        `
+        SELECT *
+        FROM ai_events
+        WHERE plate = $1
+          AND ts > (to_timestamp($2) - interval '10 seconds')
+          AND ts < (to_timestamp($2) + interval '10 seconds')
+        ORDER BY ts DESC
+        LIMIT 1;
+        `,
+        [observedPlate, scanTsSec]
+      );
+      aiEvent = aiRes.rows[0] || null;
+    }
+
+    // 5) Previous counter for this UUID (replay detection)
     let lastCounter = null;
     if (body.uuid) {
       const cRes = await query(
@@ -160,26 +220,26 @@ router.post("/", requireAuth, async (req, res) => {
       lastCounter = cRes.rows[0]?.counter ?? null;
     }
 
-    // 5) Run fusion brain
+    // 6) Run fusion brain (your decideFusion() already knows MATCH/MISMATCH/MISSING logic)
     const fusion = decideFusion({
       registryVehicle,
       scanEvent: {
-        plate: body.plate || null,
-        uuid: body.uuid,
+        plate: observedPlate || null,
+        uuid: body.uuid || null,
         counter: body.counter ?? 0,
         sig_valid: body.sig_valid ?? true,
         chal_valid: body.chal_valid ?? true,
-        pubkey_match: body.pubkey_match ?? true,   // not stored, but we can pass from body
+        pubkey_match: body.pubkey_match ?? null,
         tamper: body.tamper ?? body.tamper_flag ?? false,
         rssi: body.rssi ?? null,
         est_distance_m: body.est_distance_m ?? null
       },
       anprEvent,
-      aiEvent: null,        // we’ll add AI later
+      aiEvent,
       lastCounter
     });
 
-    // 6) Store fusion result into fusion_events
+    // 7) Store fusion result into fusion_events (include cloud authority in raw_json)
     const fusionSql = `
       INSERT INTO fusion_events (
         plate,
@@ -196,6 +256,31 @@ router.post("/", requireAuth, async (req, res) => {
       RETURNING id, created_at;
     `;
 
+    const fusionPayload = {
+      ...fusion,
+      cloud: {
+        cloud_verdict,
+        cloud_action,
+        reasonsCloud,
+        registryVehicle: registryVehicle
+          ? {
+              plate: registryVehicle.plate,
+              vin: registryVehicle.vin,
+              make: registryVehicle.make,
+              model: registryVehicle.model,
+              colour: registryVehicle.colour,
+              status: registryVehicle.status,
+              public_key: registryVehicle.public_key
+            }
+          : null
+      },
+      linked: {
+        anpr_id: anprEvent?.id ?? null,
+        ai_id: aiEvent?.id ?? null,
+        scan_id: row.id
+      }
+    };
+
     const fusionRes = await query(fusionSql, [
       fusion.plate,
       row.id,
@@ -205,12 +290,12 @@ router.post("/", requireAuth, async (req, res) => {
       fusion.has_gotid,
       fusion.registry_status,
       fusion.reasons,
-      fusion
+      fusionPayload
     ]);
 
     const fusionId = fusionRes.rows[0].id;
 
-    // 7) Response back to caller (scanner, tools, etc.)
+    // 8) Respond
     res.json({
       ok: true,
       id: row.id,
@@ -219,7 +304,26 @@ router.post("/", requireAuth, async (req, res) => {
       fusion_verdict: fusion.fusion_verdict,
       final_label: fusion.final_label,
       visual_confidence: fusion.visual_confidence,
-      reasons: fusion.reasons
+      reasons: fusion.reasons,
+
+      // cloud authority result
+      cloud_verdict,
+      cloud_action,
+      cloud_reasons: reasonsCloud,
+      cloud_vehicle: registryVehicle
+        ? {
+            plate: registryVehicle.plate,
+            vin: registryVehicle.vin,
+            make: registryVehicle.make,
+            model: registryVehicle.model,
+            colour: registryVehicle.colour,
+            status: registryVehicle.status
+          }
+        : null,
+
+      // evidence links
+      anpr_id: anprEvent?.id ?? null,
+      ai_id: aiEvent?.id ?? null
     });
   } catch (err) {
     console.error("scan insert / fusion error:", err);
@@ -230,10 +334,6 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /v1/scans/recent
- * Returns the most recent 100 scans for the admin dashboard.
- */
 router.get("/recent", requireAuth, async (req, res) => {
   try {
     const sql = `
@@ -264,16 +364,10 @@ router.get("/recent", requireAuth, async (req, res) => {
       LIMIT 100;
     `;
     const result = await query(sql);
-    res.json({
-      ok: true,
-      scans: result.rows
-    });
+    res.json({ ok: true, scans: result.rows });
   } catch (err) {
     console.error("scan recent error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "DB query error"
-    });
+    res.status(500).json({ ok: false, error: "DB query error" });
   }
 });
 
