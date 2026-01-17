@@ -60,7 +60,7 @@ function normStatus(s) {
 }
 
 /* ---------- production limits ---------- */
-const MAX_RAW_JSON_BYTES = 8192;        // prevents abuse / DB bloat
+const MAX_RAW_JSON_BYTES = 8192;
 const MAX_UUID_LEN = 128;
 const MAX_PLATE_LEN = 16;
 const MAX_SCANNER_ID_LEN = 64;
@@ -75,10 +75,7 @@ router.post("/", requireAuth, async (req, res) => {
     // ---- 0) Validate + normalise payload (production hygiene) ----
     const raw = asObj(body.raw_json);
     if (jsonSizeBytes(raw) > MAX_RAW_JSON_BYTES) {
-      return res.status(413).json({
-        ok: false,
-        error: "raw_json too large"
-      });
+      return res.status(413).json({ ok: false, error: "raw_json too large" });
     }
 
     const observedPlate = normPlate(asStr(body.plate, MAX_PLATE_LEN, "") || "");
@@ -122,12 +119,9 @@ router.post("/", requireAuth, async (req, res) => {
       asStr(raw.pubkey_hex ?? body.pubkey_hex, 300, "") || ""
     );
 
-    // Optional guard: if provided, must be hex
+    // If provided, must be hex
     if (!isHexOrEmpty(observedPubkeyHex)) {
-      return res.status(400).json({
-        ok: false,
-        error: "pubkey_hex malformed (non-hex)"
-      });
+      return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
     // ---- 1) Insert scan_events (forensic record) ----
@@ -204,30 +198,48 @@ router.post("/", requireAuth, async (req, res) => {
     const scanRow = insertRes.rows[0];
     const scanTsSec = Math.floor(new Date(scanRow.created_at).getTime() / 1000);
 
-    // ---- 2) Cloud Master Authority lookup (pubkey-first + police-grade KEY_MISMATCH) ----
+    // ---- 2) Cloud Master Authority lookup (pubkey-first + police-grade KEY_MISMATCH + UUID_MISSING) ----
     const reasonsCloud = [];
     let registryVehicle = null;
     let cloud_verdict = "UUID_MISSING";
     let cloud_action = "INVESTIGATE";
 
     if (!observedPubkeyHex) {
+      // No tag identity captured. Check whether the plate is enrolled.
       reasonsCloud.push("No pubkey_hex provided by scanner (tag missing / not captured).");
+
+      if (observedPlate) {
+        const pRes = await query("SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;", [
+          observedPlate
+        ]);
+
+        if (pRes.rows.length) {
+          registryVehicle = pRes.rows[0];
+          cloud_verdict = "UUID_MISSING";
+          cloud_action = "INVESTIGATE";
+          reasonsCloud.push(
+            "Plate is enrolled but no GOT-ID identity was captured within scan window."
+          );
+        } else {
+          cloud_verdict = "UNREGISTERED_VEHICLE";
+          cloud_action = "INVESTIGATE";
+          reasonsCloud.push("Plate not found in registry (not enrolled / unknown vehicle).");
+        }
+      }
     } else {
+      // Pubkey present -> look up identity
       const keys = pubkeyCandidates(observedPubkeyHex);
 
+      // This should be rare because we already validate hex, but keep it for safety.
       if (!keys.length) {
         cloud_verdict = "INVALID_IDENTITY";
         cloud_action = "STOP_INVESTIGATE";
-        reasonsCloud.push("pubkey_hex malformed (non-hex).");
+        reasonsCloud.push("pubkey_hex invalid (no usable candidates).");
       } else {
         let v = null;
 
-        // Try both forms (with/without 04 prefix)
         for (const k of keys) {
-          const vRes = await query(
-            "SELECT * FROM vehicles WHERE public_key = $1 LIMIT 1;",
-            [k]
-          );
+          const vRes = await query("SELECT * FROM vehicles WHERE public_key = $1 LIMIT 1;", [k]);
           if (vRes.rows.length) {
             v = vRes.rows[0];
             break;
@@ -235,12 +247,11 @@ router.post("/", requireAuth, async (req, res) => {
         }
 
         if (!v) {
-          // Police-grade clarity: if plate exists in registry but pubkey doesn't -> KEY_MISMATCH
+          // If plate exists in registry but pubkey doesn't -> KEY_MISMATCH (suspected clone)
           if (observedPlate) {
-            const pRes = await query(
-              "SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;",
-              [observedPlate]
-            );
+            const pRes = await query("SELECT * FROM vehicles WHERE plate = $1 LIMIT 1;", [
+              observedPlate
+            ]);
 
             if (pRes.rows.length) {
               registryVehicle = pRes.rows[0];
@@ -272,7 +283,9 @@ router.post("/", requireAuth, async (req, res) => {
             if (observedPlate && assignedPlate && observedPlate !== assignedPlate) {
               cloud_verdict = "MISMATCH";
               cloud_action = "STOP";
-              reasonsCloud.push(`Plate mismatch observed=${observedPlate} assigned=${assignedPlate}`);
+              reasonsCloud.push(
+                `Plate mismatch observed=${observedPlate} assigned=${assignedPlate}`
+              );
             } else {
               cloud_verdict = "AUTHENTIC";
               cloud_action = "NONE";
@@ -348,7 +361,7 @@ router.post("/", requireAuth, async (req, res) => {
         tamper: tamper_flag,
         rssi,
         est_distance_m,
-        cloud_verdict // <-- critical for police-grade mapping in fusion.js
+        cloud_verdict // used for police-grade mapping in fusion.js
       },
       anprEvent,
       aiEvent,
@@ -441,10 +454,7 @@ router.post("/", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("scan insert / fusion error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "DB insert or fusion error"
-    });
+    res.status(500).json({ ok: false, error: "DB insert or fusion error" });
   }
 });
 
