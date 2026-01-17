@@ -245,7 +245,7 @@ router.post("/", requireAuth, async (req, res) => {
             if (pRes.rows.length) {
               registryVehicle = pRes.rows[0];
               cloud_verdict = "KEY_MISMATCH";
-              cloud_action = "INVESTIGATE";
+              cloud_action = "STOP";
               reasonsCloud.push(
                 `Plate ${observedPlate} is enrolled, but pubkey_hex is not enrolled/matching. Possible clone.`
               );
