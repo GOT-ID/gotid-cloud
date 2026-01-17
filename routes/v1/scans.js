@@ -305,8 +305,8 @@ router.post("/", requireAuth, async (req, res) => {
         SELECT *
         FROM anpr_events
         WHERE plate = $1
-          AND ts > (to_timestamp($2) - interval '10 seconds')
-          AND ts < (to_timestamp($2) + interval '10 seconds')
+          AND ts > (to_timestamp($2) - interval '40 seconds')
+          AND ts < (to_timestamp($2) + interval '40 seconds')
         ORDER BY ts DESC
         LIMIT 1;
         `,
@@ -323,8 +323,8 @@ router.post("/", requireAuth, async (req, res) => {
         SELECT *
         FROM ai_events
         WHERE plate = $1
-          AND ts > (to_timestamp($2) - interval '10 seconds')
-          AND ts < (to_timestamp($2) + interval '10 seconds')
+          AND ts > (to_timestamp($2) - interval '40 seconds')
+          AND ts < (to_timestamp($2) + interval '40 seconds')
         ORDER BY ts DESC
         LIMIT 1;
         `,
@@ -501,3 +501,4 @@ router.get("/recent", requireAuth, async (req, res) => {
 });
 
 export default router;
+
