@@ -9,6 +9,7 @@ import scansRoute from "./routes/v1/scans.js";
 import authRoute from "./routes/v1/auth.js";
 import anprRoute from "./routes/v1/anpr.js";
 import aiRoute from "./routes/v1/ai.js";
+import fusionRoute from "./routes/v1/fusion.js"; // ✅ ADD THIS
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
@@ -45,7 +46,9 @@ app.get("/", (req, res) => {
       scans_recent: "/v1/scans/recent",
       auth_status: "/v1/auth/status",
       anpr: "/v1/anpr",
-      ai: "/v1/ai"
+      ai: "/v1/ai",
+      fusion: "/v1/fusion",                 // ✅ ADD THIS
+      fusion_recent: "/v1/fusion/recent"    // ✅ ADD THIS
     }
   });
 });
@@ -58,6 +61,7 @@ app.use("/v1/scans", scansRoute);
 app.use("/v1/auth", authRoute);
 app.use("/v1/anpr", anprRoute);
 app.use("/v1/ai", aiRoute);
+app.use("/v1/fusion", fusionRoute); // ✅ ADD THIS
 
 // ----------------------------------------------
 // 404 FALLBACK
