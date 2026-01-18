@@ -12,6 +12,32 @@ function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
 }
 
+/**
+ * NEW (added): GET /v1/anpr/recent?limit=10
+ * Lets you confirm the cloud is receiving ANPR events from your laptop script.
+ */
+router.get("/recent", requireAuth, async (req, res) => {
+  try {
+    const limitRaw = parseInt(String(req.query.limit ?? "20"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 20;
+
+    const r = await query(
+      `
+      SELECT id, plate, ts, camera_id, confidence, raw_json
+      FROM anpr_events
+      ORDER BY ts DESC
+      LIMIT $1;
+      `,
+      [limit]
+    );
+
+    res.json({ ok: true, count: r.rows.length, rows: r.rows });
+  } catch (err) {
+    console.error("Error in GET /v1/anpr/recent:", err);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 router.post("/", requireAuth, async (req, res) => {
   try {
     const { plate, timestamp, camera_id, confidence, raw } = req.body || {};
@@ -118,28 +144,6 @@ router.post("/", requireAuth, async (req, res) => {
     res.status(201).json({ ok: true, anpr_id: row.id, ts: row.ts });
   } catch (err) {
     console.error("Error in POST /v1/anpr:", err);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-// Debug: get most recent ANPR events (for sanity-checking)
-router.get("/recent", requireAuth, async (req, res) => {
-  try {
-    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
-
-    const r = await query(
-      `
-      SELECT id, plate, ts, camera_id, confidence, raw_json
-      FROM anpr_events
-      ORDER BY ts DESC
-      LIMIT $1;
-      `,
-      [limit]
-    );
-
-    res.json({ ok: true, count: r.rows.length, rows: r.rows });
-  } catch (err) {
-    console.error("Error in GET /v1/anpr/recent:", err);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
