@@ -122,4 +122,26 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
+// Debug: get most recent ANPR events (for sanity-checking)
+router.get("/recent", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 25)));
+
+    const r = await query(
+      `
+      SELECT id, plate, ts, camera_id, confidence, raw_json
+      FROM anpr_events
+      ORDER BY ts DESC
+      LIMIT $1;
+      `,
+      [limit]
+    );
+
+    res.json({ ok: true, count: r.rows.length, rows: r.rows });
+  } catch (err) {
+    console.error("Error in GET /v1/anpr/recent:", err);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 export default router;
