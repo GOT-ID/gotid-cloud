@@ -48,6 +48,28 @@ router.post("/", requireAuth, async (req, res) => {
     const tsSeconds =
       typeof timestamp === "number" ? timestamp : Math.floor(Date.now() / 1000);
 
+    // 0) REGISTRY GATE (ADDED)
+    // Only enrolled vehicles that actually have GOT-ID should create UUID_MISSING.
+    // This prevents "random plates" from spamming UUID_MISSING rows.
+    const regRes = await query(
+      `
+      SELECT plate, status, gotid_uuid, raw_json
+      FROM vehicles
+      WHERE plate = $1
+      LIMIT 1;
+      `,
+      [p]
+    );
+
+    const reg = regRes.rows[0] || null;
+
+    // Determine "has_gotid" from either gotid_uuid OR raw_json.has_gotid (if you store it there)
+    const hasGotId =
+      !!(reg && reg.gotid_uuid && String(reg.gotid_uuid).trim().length > 0) ||
+      !!(reg && reg.raw_json && reg.raw_json.has_gotid === true);
+
+    const registryStatus = reg?.status || "UNKNOWN";
+
     // 1) Insert ANPR event
     const sql = `
       INSERT INTO anpr_events (
@@ -69,34 +91,16 @@ router.post("/", requireAuth, async (req, res) => {
     const row = r.rows[0];
 
     // 2) UUID_MISSING creation logic (police-grade):
-    // If NO scan_event arrives for this plate within ±SIGN_WINDOW_SEC,
-    // we create a fusion_events record with verdict UUID_MISSING.
-    //
-    // IMPORTANT: This is the only way “missing tag” becomes real-world evidence:
-    // car seen (ANPR) + no crypto identity observed in time window.
-
-    const scanRes = await query(
-      `
-      SELECT id
-      FROM scan_events
-      WHERE plate = $1
-        AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
-        AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
-      ORDER BY created_at DESC
-      LIMIT 1;
-      `,
-      [p, tsSeconds]
-    );
-
-    if (scanRes.rows.length === 0) {
-      // de-dupe: don’t spam UUID_MISSING if ANPR posts repeatedly
-      const existsRes = await query(
+    // Only if:
+    //  - plate is ENROLLED (exists in vehicles)
+    //  - has_gotid === true (tag expected)
+    //  - no scan_event arrives within ±SIGN_WINDOW_SEC
+    if (reg && hasGotId === true) {
+      const scanRes = await query(
         `
         SELECT id
-        FROM fusion_events
+        FROM scan_events
         WHERE plate = $1
-          AND scan_id IS NULL
-          AND fusion_verdict = 'UUID_MISSING'
           AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
           AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
         ORDER BY created_at DESC
@@ -105,43 +109,73 @@ router.post("/", requireAuth, async (req, res) => {
         [p, tsSeconds]
       );
 
-      if (existsRes.rows.length === 0) {
-        await query(
+      if (scanRes.rows.length === 0) {
+        // de-dupe: don’t spam UUID_MISSING if ANPR posts repeatedly
+        const existsRes = await query(
           `
-          INSERT INTO fusion_events (
-            plate,
-            scan_id,
-            fusion_verdict,
-            final_label,
-            visual_confidence,
-            has_gotid,
-            registry_status,
-            reasons,
-            raw_json
-          )
-          VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8);
+          SELECT id
+          FROM fusion_events
+          WHERE plate = $1
+            AND scan_id IS NULL
+            AND fusion_verdict = 'UUID_MISSING'
+            AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
+            AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
+          ORDER BY created_at DESC
+          LIMIT 1;
           `,
-          [
-            p,
-            "UUID_MISSING",
-            "NO_GOTID_TAG",
-            confidence ?? null,
-            false,
-            "UNKNOWN",
-            ["ANPR saw vehicle but no GOT-ID scan arrived within window."],
-            {
-              anpr_id: row.id,
-              plate: p,
-              ts: row.ts,
-              camera_id: camera_id || "C920_CAM",
-              confidence: confidence ?? null
-            }
-          ]
+          [p, tsSeconds]
         );
+
+        if (existsRes.rows.length === 0) {
+          await query(
+            `
+            INSERT INTO fusion_events (
+              plate,
+              scan_id,
+              fusion_verdict,
+              final_label,
+              visual_confidence,
+              has_gotid,
+              registry_status,
+              reasons,
+              raw_json
+            )
+            VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8);
+            `,
+            [
+              p,
+              "UUID_MISSING",
+              // IMPORTANT: this label means "tag expected but missing"
+              "CLONE_MISSING_TAG_STRONG",
+              confidence ?? null,
+              true,
+              registryStatus,
+              ["Enrolled vehicle seen by ANPR but no GOT-ID scan arrived within window."],
+              {
+                anpr_id: row.id,
+                plate: p,
+                ts: row.ts,
+                camera_id: camera_id || "C920_CAM",
+                confidence: confidence ?? null,
+                registry_status: registryStatus,
+                has_gotid: true
+              }
+            ]
+          );
+        }
       }
     }
 
-    res.status(201).json({ ok: true, anpr_id: row.id, ts: row.ts });
+    // Always return success for ANPR ingestion
+    res.status(201).json({
+      ok: true,
+      anpr_id: row.id,
+      ts: row.ts,
+      // Helpful debug fields (doesn't break anything)
+      enrolled: !!reg,
+      has_gotid: hasGotId === true,
+      registry_status: registryStatus
+    });
   } catch (err) {
     console.error("Error in POST /v1/anpr:", err);
     res.status(500).json({ ok: false, error: "server_error" });
