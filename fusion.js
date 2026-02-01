@@ -19,6 +19,13 @@ function normStr(s) {
   return (s || "").toString().trim().toUpperCase();
 }
 
+// Helper: parse event timestamps safely (ms since epoch)
+function toMs(ts) {
+  if (!ts) return null;
+  const t = new Date(ts).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
 export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, lastCounter }) {
   const fused = {
     fusion_verdict: null,       // raw verdict
@@ -87,13 +94,28 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
         fused.fusion_verdict = "UUID_MISSING";
         fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
       } else {
-        // Counter checks (replay / rollback)
+        // Counter checks (replay / rollback) — police-grade handling
+        // Rapid re-scans often see the same counter (benign). Only warn if repeat happens after a longer window.
+        const DUP_WINDOW_S = 20;     // benign repeated observation
+        const REPLAY_WINDOW_S = 60;  // repetition beyond this becomes suspicious
+
         if (typeof lastCounter === "number" && typeof scanEvent.counter === "number") {
           if (scanEvent.counter < lastCounter) {
             fused.fusion_verdict = "COUNTER_ROLLBACK";
-            fused.reasons.push("Counter rolled back compared to previous scan (possible replay/clone).");
+            fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
           } else if (scanEvent.counter === lastCounter) {
-            fused.reasons.push("Counter did not advance since previous scan (possible replay).");
+            // Try to use scanEvent.created_at if present. If not, don't shout about replay.
+            const scanTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
+            const nowTs = Date.now();
+            const dtS = scanTs ? Math.abs(nowTs - scanTs) / 1000 : null;
+
+            if (dtS !== null && dtS <= DUP_WINDOW_S) {
+              // benign duplicate scan — do nothing
+            } else if (dtS !== null && dtS >= REPLAY_WINDOW_S) {
+              fused.reasons.push(`Counter repeated after ${Math.round(dtS)}s (possible replay).`);
+            } else {
+              // If we don't have good timing context, keep quiet to avoid false alarms.
+            }
           }
         }
 
