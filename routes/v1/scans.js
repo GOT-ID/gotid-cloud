@@ -420,11 +420,11 @@ router.post("/", requireAuth, async (req, res) => {
           : null
       },
       linked: {
-  anpr_id: anprEvent?.id ?? null,
-  ai_id: aiEvent?.id ?? null,
-  scan_event_id: scanRow.id,
-  match_delta_ms: matchDeltaMs
-}
+        anpr_id: anprEvent?.id ?? null,
+        ai_id: aiEvent?.id ?? null,
+        scan_event_id: scanRow.id,
+        match_delta_ms: matchDeltaMs
+      }
     };
 
     const fusionRes = await query(fusionSql, [
