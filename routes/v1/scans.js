@@ -297,7 +297,7 @@ router.post("/", requireAuth, async (req, res) => {
       }
     }
 
-    // ---- 3) Find nearest ANPR event within ±10 seconds ----
+    // ---- 3) Find nearest ANPR event within ±10 seconds (true nearest) ----
     let anprEvent = null;
     if (observedPlate) {
       const anprRes = await query(
@@ -305,17 +305,17 @@ router.post("/", requireAuth, async (req, res) => {
         SELECT *
         FROM anpr_events
         WHERE plate = $1
-          AND ts > (to_timestamp($2) - interval '40 seconds')
-          AND ts < (to_timestamp($2) + interval '40 seconds')
-        ORDER BY ts DESC
+          AND ts BETWEEN ($2::timestamptz - interval '10 seconds')
+                     AND ($2::timestamptz + interval '10 seconds')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (ts - $2::timestamptz))) ASC
         LIMIT 1;
         `,
-        [observedPlate, scanTsSec]
+        [observedPlate, scanRow.created_at]
       );
       anprEvent = anprRes.rows[0] || null;
     }
 
-    // ---- 4) Find nearest AI event within ±10 seconds ----
+      // ---- 4) Find nearest AI event within ±10 seconds (true nearest) ----
     let aiEvent = null;
     if (observedPlate) {
       const aiRes = await query(
@@ -323,12 +323,12 @@ router.post("/", requireAuth, async (req, res) => {
         SELECT *
         FROM ai_events
         WHERE plate = $1
-          AND ts > (to_timestamp($2) - interval '40 seconds')
-          AND ts < (to_timestamp($2) + interval '40 seconds')
-        ORDER BY ts DESC
+          AND ts BETWEEN ($2::timestamptz - interval '10 seconds')
+                     AND ($2::timestamptz + interval '10 seconds')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (ts - $2::timestamptz))) ASC
         LIMIT 1;
         `,
-        [observedPlate, scanTsSec]
+        [observedPlate, scanRow.created_at]
       );
       aiEvent = aiRes.rows[0] || null;
     }
@@ -365,6 +365,13 @@ router.post("/", requireAuth, async (req, res) => {
         }
       : null;
 
+    let matchDeltaMs = null;
+    if (anprEvent?.ts) {
+      matchDeltaMs = Math.abs(
+        new Date(scanRow.created_at).getTime() - new Date(anprEvent.ts).getTime()
+      );
+    }
+
     const fusion = decideFusion({
       registryVehicle,
       scanEvent: scanEventForFusion,
@@ -374,10 +381,14 @@ router.post("/", requireAuth, async (req, res) => {
     });
 
     // ---- 7) Store fusion result ----
-    const fusionSql = `
+     const fusionSql = `
       INSERT INTO fusion_events (
         plate,
         scan_id,
+        scan_event_id,
+        anpr_id,
+        ai_id,
+        match_delta_ms,
         fusion_verdict,
         final_label,
         visual_confidence,
@@ -386,7 +397,7 @@ router.post("/", requireAuth, async (req, res) => {
         reasons,
         raw_json
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       RETURNING id, created_at;
     `;
 
@@ -417,7 +428,11 @@ router.post("/", requireAuth, async (req, res) => {
 
     const fusionRes = await query(fusionSql, [
       fusion.plate,
-      scanRow.id,
+      scanRow.id,                 // legacy scan_id
+      scanRow.id,                 // new scan_event_id
+      anprEvent?.id ?? null,
+      aiEvent?.id ?? null,
+      matchDeltaMs,
       fusion.fusion_verdict,
       fusion.final_label,
       fusion.visual_confidence,
