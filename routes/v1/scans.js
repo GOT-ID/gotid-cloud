@@ -200,7 +200,7 @@ router.post("/", requireAuth, async (req, res) => {
 
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
-    const scanTsSec = Math.floor(new Date(scanRow.created_at).getTime() / 1000);
+   
 
     // ---- 2) Cloud Master Authority lookup (pubkey-first + KEY_MISMATCH + UUID_MISSING) ----
     const reasonsCloud = [];
@@ -420,10 +420,11 @@ router.post("/", requireAuth, async (req, res) => {
           : null
       },
       linked: {
-        anpr_id: anprEvent?.id ?? null,
-        ai_id: aiEvent?.id ?? null,
-        scan_id: scanRow.id
-      }
+  anpr_id: anprEvent?.id ?? null,
+  ai_id: aiEvent?.id ?? null,
+  scan_event_id: scanRow.id,
+  match_delta_ms: matchDeltaMs
+}
     };
 
     const fusionRes = await query(fusionSql, [
