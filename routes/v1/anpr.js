@@ -6,7 +6,7 @@ import { query } from "../../db/index.js";
 const router = Router();
 
 // How long after ANPR we wait for a GOT-ID scan before declaring UUID_MISSING
-const SIGN_WINDOW_SEC = 10;
+const SIGN_WINDOW_SEC = 20;
 // Suppress duplicate contradictory ANPR-led alerts for the same plate/pass
 const PASS_DEDUP_SEC = 12;
 
