@@ -18,6 +18,64 @@ function getConfidence(ev) {
 function normStr(s) {
   return (s || "").toString().trim().toUpperCase();
 }
+function getAiVehicleType(aiEvent) {
+  return normStr(
+    aiEvent?.vehicle_type ||
+    aiEvent?.raw_json?.vehicle_type ||
+    aiEvent?.raw_json?.yolo_class_name ||
+    null
+  );
+}
+
+function deriveRegistryVehicleType(registryVehicle) {
+  const model = normStr(registryVehicle?.model);
+  const make = normStr(registryVehicle?.make);
+  const text = `${make} ${model}`.trim();
+
+  if (!text) return "";
+
+  if (text.includes("MOTORBIKE") || text.includes("MOTORCYCLE") || text.includes("BIKE")) return "MOTORCYCLE";
+  if (text.includes("TRUCK") || text.includes("HGV") || text.includes("LORRY")) return "TRUCK";
+  if (text.includes("BUS") || text.includes("COACH")) return "BUS";
+  if (text.includes("VAN") || text.includes("TRANSIT")) return "VAN";
+
+  if (
+    text.includes("HATCHBACK") ||
+    text.includes("SALOON") ||
+    text.includes("SEDAN") ||
+    text.includes("ESTATE") ||
+    text.includes("COUPE") ||
+    text.includes("CABRIOLET") ||
+    text.includes("CONVERTIBLE") ||
+    text.includes("SUV") ||
+    text.includes("CROSSOVER") ||
+    text.includes("AUDI") ||
+    text.includes("BMW") ||
+    text.includes("FORD") ||
+    text.includes("VOLKSWAGEN") ||
+    text.includes("VW") ||
+    text.includes("MERCEDES") ||
+    text.includes("TOYOTA") ||
+    text.includes("HONDA") ||
+    text.includes("NISSAN") ||
+    text.includes("PEUGEOT") ||
+    text.includes("RENAULT") ||
+    text.includes("KIA") ||
+    text.includes("HYUNDAI")
+  ) return "CAR";
+
+  return "";
+}
+
+function vehicleTypeMatches(aiType, regType) {
+  const a = normStr(aiType);
+  const r = normStr(regType);
+
+  if (!a || !r) return false;
+  if (a === r) return true;
+
+  return false;
+}
 
 // Helper: parse event timestamps safely (ms since epoch)
 function toMs(ts) {
@@ -150,7 +208,7 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     else if (c >= 0.7) visualScore += 1;
   }
 
-  // AI presence boosts confidence; if make/colour exist, compare with registry and score accordingly
+ // AI presence boosts confidence; compare type/make/colour with registry where available
   if (aiEvent) {
     const c = getConfidence(aiEvent);
     if (c === null) visualScore += 1;
@@ -159,21 +217,34 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
 
     if (registryVehicle) {
       const aiMake = normStr(aiEvent.make);
-      const aiColour = normStr(aiEvent.colour);
+      const aiColour = normStr(aiEvent.colour || aiEvent.raw_json?.colour_estimate);
+      const aiType = getAiVehicleType(aiEvent);
+
       const regMake = normStr(registryVehicle.make);
       const regColour = normStr(registryVehicle.colour);
+      const regType = deriveRegistryVehicleType(registryVehicle);
 
       const makeMatches = aiMake && regMake && aiMake === regMake;
       const colourMatches = aiColour && regColour && aiColour === regColour;
+      const typeMatches = vehicleTypeMatches(aiType, regType);
 
-      // If AI provided appearance and it matches, add support; if it conflicts, note it.
-      if (makeMatches || colourMatches) visualScore += 1;
-      else if ((aiMake && regMake && aiMake !== regMake) || (aiColour && regColour && aiColour !== regColour)) {
-        fused.reasons.push("AI appearance does not fully match registry (make/colour).");
+      if (makeMatches || colourMatches || typeMatches) {
+        visualScore += 1;
+      }
+
+      if (typeMatches) {
+        fused.reasons.push(`AI vehicle type matches registry (${aiType}).`);
+      }
+
+      if (
+        (aiMake && regMake && aiMake !== regMake) ||
+        (aiColour && regColour && aiColour !== regColour) ||
+        (aiType && regType && !typeMatches)
+      ) {
+        fused.reasons.push("AI appearance does not fully match registry (type/make/colour).");
       }
     }
   }
-
   if (visualScore >= 4) fused.visual_confidence = "STRONG";
   else if (visualScore >= 2) fused.visual_confidence = "MEDIUM";
   else if (visualScore >= 1) fused.visual_confidence = "WEAK";
