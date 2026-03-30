@@ -69,11 +69,13 @@ router.post("/", requireAuth, async (req, res) => {
     const tsSeconds =
       typeof timestamp === "number" ? timestamp : Math.floor(Date.now() / 1000);
 
+    const camId = camera_id || "C920_CAM";
+
     // 0) REGISTRY GATE
     // Only enrolled vehicles that actually have GOT-ID should create UUID_MISSING.
     const regRes = await query(
       `
-      SELECT plate, status, gotid_uuid, raw_json, make, model, colour, vin
+      SELECT plate, status, gotid_uuid, public_key, raw_json, make, model, colour, vin
       FROM vehicles
       WHERE plate = $1
       LIMIT 1;
@@ -84,11 +86,11 @@ router.post("/", requireAuth, async (req, res) => {
     const reg = regRes.rows[0] || null;
 
     const hasGotId =
+      !!(reg && reg.public_key && String(reg.public_key).trim().length > 0) ||
       !!(reg && reg.gotid_uuid && String(reg.gotid_uuid).trim().length > 0) ||
       !!(reg && reg.raw_json && reg.raw_json.has_gotid === true);
 
     const registryStatus = reg?.status || "UNKNOWN";
-    const camId = camera_id || "C920_CAM";
 
     // 1) Insert ANPR event
     const insertAnprSql = `
@@ -138,15 +140,27 @@ router.post("/", requireAuth, async (req, res) => {
     // Only if:
     //  - plate is ENROLLED
     //  - has_gotid === true
-    //  - no scan_event arrives within ±SIGN_WINDOW_SEC
+    //  - no VALID identity scan_event arrives within ±SIGN_WINDOW_SEC
     if (reg && hasGotId === true) {
       const scanRes = await query(
         `
-        SELECT id, created_at, result, plate
+        SELECT
+          id,
+          created_at,
+          result,
+          plate,
+          sig_valid,
+          chal_valid,
+          raw_json
         FROM scan_events
         WHERE plate = $1
           AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
           AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
+          AND (
+            NULLIF(raw_json->>'pubkey_hex', '') IS NOT NULL
+            OR sig_valid = true
+            OR chal_valid = true
+          )
         ORDER BY created_at DESC
         LIMIT 1;
         `,
@@ -154,13 +168,13 @@ router.post("/", requireAuth, async (req, res) => {
       );
 
       if (scanRes.rows.length === 0) {
-        // Suppress UUID_MISSING if the same plate already got a recent MATCH
+        // Suppress UUID_MISSING if the same plate already got a recent positive authenticated outcome
         const recentMatchRes = await query(
           `
           SELECT id
           FROM fusion_events
           WHERE plate = $1
-            AND fusion_verdict = 'MATCH'
+            AND final_label IN ('MATCH_STRONG', 'MATCH_WEAK_VISUAL')
             AND created_at > (to_timestamp($2) - interval '${PASS_DEDUP_SEC} seconds')
             AND created_at < (to_timestamp($2) + interval '${PASS_DEDUP_SEC} seconds')
           ORDER BY created_at DESC
@@ -195,7 +209,7 @@ router.post("/", requireAuth, async (req, res) => {
             }
 
             const reasons = [
-              "Enrolled vehicle seen by ANPR but no GOT-ID scan arrived within window."
+              "Enrolled vehicle seen by ANPR but no valid GOT-ID identity was captured within window."
             ];
 
             if (aiEvent) {
