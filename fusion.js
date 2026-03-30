@@ -8,16 +8,20 @@ function num(v) {
 // confidence may be stored as a column OR inside raw_json.confidence
 function getConfidence(ev) {
   if (!ev) return null;
+
   const c1 = num(ev.confidence);
   if (c1 !== null) return c1;
+
   const c2 = num(ev.raw_json?.confidence);
   if (c2 !== null) return c2;
+
   return null;
 }
 
 function normStr(s) {
   return (s || "").toString().trim().toUpperCase();
 }
+
 function getAiVehicleType(aiEvent) {
   return normStr(
     aiEvent?.vehicle_type ||
@@ -34,10 +38,27 @@ function deriveRegistryVehicleType(registryVehicle) {
 
   if (!text) return "";
 
-  if (text.includes("MOTORBIKE") || text.includes("MOTORCYCLE") || text.includes("BIKE")) return "MOTORCYCLE";
-  if (text.includes("TRUCK") || text.includes("HGV") || text.includes("LORRY")) return "TRUCK";
-  if (text.includes("BUS") || text.includes("COACH")) return "BUS";
-  if (text.includes("VAN") || text.includes("TRANSIT")) return "VAN";
+  if (
+    text.includes("MOTORBIKE") ||
+    text.includes("MOTORCYCLE") ||
+    text.includes("BIKE")
+  ) return "MOTORCYCLE";
+
+  if (
+    text.includes("TRUCK") ||
+    text.includes("HGV") ||
+    text.includes("LORRY")
+  ) return "TRUCK";
+
+  if (
+    text.includes("BUS") ||
+    text.includes("COACH")
+  ) return "BUS";
+
+  if (
+    text.includes("VAN") ||
+    text.includes("TRANSIT")
+  ) return "VAN";
 
   if (
     text.includes("HATCHBACK") ||
@@ -85,6 +106,18 @@ function toMs(ts) {
 }
 
 export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, lastCounter }) {
+  const cloudVerdict = scanEvent?.cloud_verdict || null;
+  const scannerResult = scanEvent?.scanner_result || null;
+
+  // Strict identity presence:
+  // Only trust actual scan evidence, not a downstream label alone.
+  const hasIdentity =
+    scanEvent?.has_identity === true ||
+    (scanEvent?.uuid && String(scanEvent.uuid).trim().length > 0) ||
+    scanEvent?.pubkey_match === true ||
+    scanEvent?.sig_valid === true ||
+    scanEvent?.chal_valid === true;
+
   const fused = {
     fusion_verdict: null,       // raw verdict
     final_label: null,          // officer label
@@ -92,7 +125,8 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     reasons: [],
     plate: anprEvent?.plate || scanEvent?.plate || registryVehicle?.plate || null,
 
-    // If has_gotid is missing in DB rows, treat "vehicle exists in registry" as enrolled for GOT-ID unless explicitly false.
+    // If has_gotid is missing in DB rows, treat "vehicle exists in registry" as enrolled
+    // unless explicitly false.
     has_gotid: registryVehicle ? (registryVehicle.has_gotid ?? true) : false,
     registry_status: registryVehicle?.status || "unknown",
 
@@ -103,7 +137,8 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
       tamper: scanEvent?.tamper ?? null,
       counter: scanEvent?.counter ?? null,
       last_counter: lastCounter ?? null,
-      cloud_verdict: scanEvent?.cloud_verdict ?? null,
+      cloud_verdict: cloudVerdict,
+      scanner_result: scannerResult,
       has_identity: scanEvent?.has_identity ?? null
     },
 
@@ -112,28 +147,44 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     scan: scanEvent || null
   };
 
-  // Pull through cloud authority classification (from scans.js)
-  const cloudVerdict = scanEvent?.cloud_verdict || null;
-
-  // Determine whether we truly captured a GOT-ID identity in this scan
-  // (uuid alone can be null; the key proof is typically pubkey/identity captured)
-  const hasIdentity =
-    scanEvent?.has_identity === true ||
-    (scanEvent?.uuid && String(scanEvent.uuid).trim().length > 0) ||
-    scanEvent?.pubkey_match === true || // if scanner computed this, identity was present
-    cloudVerdict === "AUTHENTIC" ||
-    cloudVerdict === "KEY_MISMATCH";
-
-  // ---------- 1) Core verdict ----------
-  // Police-grade rule: if the cloud already determined KEY_MISMATCH, treat as a clone-suspect mismatch.
-  if (cloudVerdict === "KEY_MISMATCH") {
+  // ---------------------------------------------------------------------------
+  // 1) Preserve strongest scanner/cloud truth first
+  // ---------------------------------------------------------------------------
+  if (scannerResult === "CLONE_SUSPECT" || cloudVerdict === "KEY_MISMATCH") {
+    fused.fusion_verdict = "MISMATCH_PUBKEY";
+    fused.reasons.push("Scanner/cloud detected pubkey mismatch or clone suspicion.");
+  } else if (scannerResult === "REPLAY_SUSPECT") {
+    fused.fusion_verdict = "REPLAY_SUSPECT";
+    fused.reasons.push("Scanner detected replay or counter rollback suspicion.");
+  } else if (scannerResult === "INVALID_TAG") {
+    fused.fusion_verdict = "INVALID_TAG";
+    fused.reasons.push("Scanner detected invalid base signature.");
+  } else if (scannerResult === "RELAY_SUSPECT") {
+    fused.fusion_verdict = "RELAY_SUSPECT";
+    fused.reasons.push("Scanner challenge-response failed; relay suspected.");
+  } else if (scannerResult === "TAMPERED") {
+    fused.fusion_verdict = "TAMPER";
+    fused.reasons.push("Scanner detected active tamper condition.");
+  } else if (cloudVerdict === "MISMATCH") {
     fused.fusion_verdict = "MISMATCH";
-    fused.reasons.push(
-      "Plate is enrolled but presented pubkey is not enrolled/matching (clone suspected)."
-    );
+    fused.reasons.push("Cloud detected plate mismatch.");
+  } else if (cloudVerdict === "REPLAY_SUSPECT") {
+    fused.fusion_verdict = "REPLAY_SUSPECT";
+    fused.reasons.push("Cloud classified scan as replay suspicion.");
+  } else if (cloudVerdict === "INVALID_TAG") {
+    fused.fusion_verdict = "INVALID_TAG";
+    fused.reasons.push("Cloud classified scan as invalid tag.");
+  } else if (cloudVerdict === "RELAY_SUSPECT") {
+    fused.fusion_verdict = "RELAY_SUSPECT";
+    fused.reasons.push("Cloud classified scan as relay suspicion.");
+  } else if (cloudVerdict === "TAMPERED") {
+    fused.fusion_verdict = "TAMPER";
+    fused.reasons.push("Cloud classified scan as tampered.");
   }
 
-  // If not already decided by cloudVerdict, proceed with original logic (with missing-identity fix)
+  // ---------------------------------------------------------------------------
+  // 2) Core verdict if not already locked by scanner/cloud truth
+  // ---------------------------------------------------------------------------
   if (!fused.fusion_verdict) {
     if (!registryVehicle) {
       fused.fusion_verdict = "NOT_ENROLLED";
@@ -147,13 +198,11 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
         fused.reasons.push("GOT-ID tag detected but vehicle is not enrolled for GOT-ID.");
       }
     } else {
-      // Vehicle IS enrolled
+      // Vehicle is enrolled
       if (!scanEvent || !hasIdentity) {
         fused.fusion_verdict = "UUID_MISSING";
         fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
       } else {
-        // Counter checks (replay / rollback) — police-grade handling
-        // Rapid re-scans often see the same counter (benign). Only warn if repeat happens after a longer window.
         const DUP_WINDOW_S = 20;     // benign repeated observation
         const REPLAY_WINDOW_S = 60;  // repetition beyond this becomes suspicious
 
@@ -162,26 +211,27 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
             fused.fusion_verdict = "COUNTER_ROLLBACK";
             fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
           } else if (scanEvent.counter === lastCounter) {
-            // Try to use scanEvent.created_at if present. If not, don't shout about replay.
             const scanTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
             const nowTs = Date.now();
             const dtS = scanTs ? Math.abs(nowTs - scanTs) / 1000 : null;
 
             if (dtS !== null && dtS <= DUP_WINDOW_S) {
-              // benign duplicate scan — do nothing
+              // benign duplicate re-observation
             } else if (dtS !== null && dtS >= REPLAY_WINDOW_S) {
+              fused.fusion_verdict = "REPLAY_SUSPECT";
               fused.reasons.push(`Counter repeated after ${Math.round(dtS)}s (possible replay).`);
-            } else {
-              // If we don't have good timing context, keep quiet to avoid false alarms.
             }
           }
         }
 
-        // If not already decided by rollback, check crypto flags
+        // If still undecided, evaluate crypto flags
         if (!fused.fusion_verdict) {
-          if (scanEvent.sig_valid === false || scanEvent.chal_valid === false) {
-            fused.fusion_verdict = "CRYPTO_FAIL";
-            fused.reasons.push("Signature or challenge-response failed.");
+          if (scanEvent.sig_valid === false) {
+            fused.fusion_verdict = "INVALID_TAG";
+            fused.reasons.push("Base signature verification failed.");
+          } else if (scanEvent.chal_valid === false) {
+            fused.fusion_verdict = "RELAY_SUSPECT";
+            fused.reasons.push("Challenge-response failed.");
           } else if (scanEvent.pubkey_match === false) {
             fused.fusion_verdict = "MISMATCH_PUBKEY";
             fused.reasons.push("GOT-ID tag pubkey does not match registry.");
@@ -197,10 +247,11 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     }
   }
 
-  // ---------- 2) Visual confidence (ANPR + AI, never overrides crypto) ----------
+  // ---------------------------------------------------------------------------
+  // 3) Visual confidence (ANPR + AI only supports, never overrides crypto)
+  // ---------------------------------------------------------------------------
   let visualScore = 0;
 
-  // ANPR presence boosts confidence
   if (anprEvent) {
     const c = getConfidence(anprEvent);
     if (c === null) visualScore += 1;
@@ -208,7 +259,6 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     else if (c >= 0.7) visualScore += 1;
   }
 
- // AI presence boosts confidence; compare type/make/colour with registry where available
   if (aiEvent) {
     const c = getConfidence(aiEvent);
     if (c === null) visualScore += 1;
@@ -216,7 +266,7 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
     else if (c >= 0.7) visualScore += 1;
 
     if (registryVehicle) {
-      const aiMake = normStr(aiEvent.make);
+      const aiMake = normStr(aiEvent.make || aiEvent.raw_json?.make);
       const aiColour = normStr(aiEvent.colour || aiEvent.raw_json?.colour_estimate);
       const aiType = getAiVehicleType(aiEvent);
 
@@ -245,12 +295,15 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
       }
     }
   }
+
   if (visualScore >= 4) fused.visual_confidence = "STRONG";
   else if (visualScore >= 2) fused.visual_confidence = "MEDIUM";
   else if (visualScore >= 1) fused.visual_confidence = "WEAK";
   else fused.visual_confidence = "NONE";
 
-  // ---------- 3) Officer label mapping ----------
+  // ---------------------------------------------------------------------------
+  // 4) Officer label mapping
+  // ---------------------------------------------------------------------------
   const v = fused.fusion_verdict;
 
   if (v === "MATCH") {
@@ -259,15 +312,18 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
         ? "MATCH_STRONG"
         : "MATCH_WEAK_VISUAL";
   } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
-    // Police-grade: missing tag is stronger if ANPR/AI saw the car
     fused.final_label =
       fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
         ? "CLONE_MISSING_TAG_STRONG"
         : "CLONE_MISSING_TAG_WEAK";
   } else if (v === "MISMATCH" || v === "MISMATCH_PUBKEY") {
     fused.final_label = "CLONE_SUSPECT";
-  } else if (v === "CRYPTO_FAIL" || v === "COUNTER_ROLLBACK") {
-    fused.final_label = "CLONE_CRYPTO";
+  } else if (v === "REPLAY_SUSPECT" || v === "COUNTER_ROLLBACK") {
+    fused.final_label = "REPLAY_SUSPECT";
+  } else if (v === "INVALID_TAG") {
+    fused.final_label = "INVALID_TAG";
+  } else if (v === "RELAY_SUSPECT") {
+    fused.final_label = "RELAY_SUSPECT";
   } else if (v === "TAMPER") {
     fused.final_label =
       fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
