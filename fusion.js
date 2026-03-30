@@ -109,24 +109,20 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
   const cloudVerdict = scanEvent?.cloud_verdict || null;
   const scannerResult = scanEvent?.scanner_result || null;
 
-  // Strict identity presence:
-  // Only trust actual scan evidence, not a downstream label alone.
   const hasIdentity =
     scanEvent?.has_identity === true ||
-    (scanEvent?.uuid && String(scanEvent.uuid).trim().length > 0) ||
     scanEvent?.pubkey_match === true ||
     scanEvent?.sig_valid === true ||
-    scanEvent?.chal_valid === true;
+    scanEvent?.chal_valid === true ||
+    (scanEvent?.uuid && String(scanEvent.uuid).trim().length > 0);
 
   const fused = {
-    fusion_verdict: null,       // raw verdict
-    final_label: null,          // officer label
-    visual_confidence: "NONE",  // NONE | WEAK | MEDIUM | STRONG
+    fusion_verdict: null,
+    final_label: null,
+    visual_confidence: "NONE",
     reasons: [],
     plate: anprEvent?.plate || scanEvent?.plate || registryVehicle?.plate || null,
 
-    // If has_gotid is missing in DB rows, treat "vehicle exists in registry" as enrolled
-    // unless explicitly false.
     has_gotid: registryVehicle ? (registryVehicle.has_gotid ?? true) : false,
     registry_status: registryVehicle?.status || "unknown",
 
@@ -136,7 +132,8 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
       pubkey_match: scanEvent?.pubkey_match ?? null,
       tamper: scanEvent?.tamper ?? null,
       counter: scanEvent?.counter ?? null,
-      last_counter: lastCounter ?? null,
+      last_counter: lastCounter?.counter ?? lastCounter ?? null,
+      last_seen_at: lastCounter?.created_at ?? null,
       cloud_verdict: cloudVerdict,
       scanner_result: scannerResult,
       has_identity: scanEvent?.has_identity ?? null
@@ -198,33 +195,39 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
         fused.reasons.push("GOT-ID tag detected but vehicle is not enrolled for GOT-ID.");
       }
     } else {
-      // Vehicle is enrolled
       if (!scanEvent || !hasIdentity) {
         fused.fusion_verdict = "UUID_MISSING";
         fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
       } else {
-        const DUP_WINDOW_S = 20;     // benign repeated observation
-        const REPLAY_WINDOW_S = 60;  // repetition beyond this becomes suspicious
+        const DUP_WINDOW_S = 20;
+        const REPLAY_WINDOW_S = 60;
 
-        if (typeof lastCounter === "number" && typeof scanEvent.counter === "number") {
-          if (scanEvent.counter < lastCounter) {
+        const prevCounter =
+          typeof lastCounter === "object" ? lastCounter?.counter : lastCounter;
+        const prevTs =
+          typeof lastCounter === "object" ? lastCounter?.created_at : null;
+
+        if (typeof prevCounter === "number" && typeof scanEvent.counter === "number") {
+          if (scanEvent.counter < prevCounter) {
             fused.fusion_verdict = "COUNTER_ROLLBACK";
             fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
-          } else if (scanEvent.counter === lastCounter) {
-            const scanTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
-            const nowTs = Date.now();
-            const dtS = scanTs ? Math.abs(nowTs - scanTs) / 1000 : null;
+          } else if (scanEvent.counter === prevCounter) {
+            const currentTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
+            const previousTs = toMs(prevTs);
+            const gapS =
+              currentTs !== null && previousTs !== null
+                ? Math.abs(currentTs - previousTs) / 1000
+                : null;
 
-            if (dtS !== null && dtS <= DUP_WINDOW_S) {
-              // benign duplicate re-observation
-            } else if (dtS !== null && dtS >= REPLAY_WINDOW_S) {
+            if (gapS !== null && gapS <= DUP_WINDOW_S) {
+              fused.reasons.push(`Same counter re-seen after ${Math.round(gapS)}s (benign duplicate window).`);
+            } else if (gapS !== null && gapS >= REPLAY_WINDOW_S) {
               fused.fusion_verdict = "REPLAY_SUSPECT";
-              fused.reasons.push(`Counter repeated after ${Math.round(dtS)}s (possible replay).`);
+              fused.reasons.push(`Counter repeated after ${Math.round(gapS)}s since previous scan (possible replay).`);
             }
           }
         }
 
-        // If still undecided, evaluate crypto flags
         if (!fused.fusion_verdict) {
           if (scanEvent.sig_valid === false) {
             fused.fusion_verdict = "INVALID_TAG";
@@ -248,7 +251,7 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
   }
 
   // ---------------------------------------------------------------------------
-  // 3) Visual confidence (ANPR + AI only supports, never overrides crypto)
+  // 3) Visual confidence
   // ---------------------------------------------------------------------------
   let visualScore = 0;
 
