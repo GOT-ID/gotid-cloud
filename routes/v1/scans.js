@@ -368,7 +368,7 @@ router.post("/", requireAuth, async (req, res) => {
       aiEvent = aiRes.rows[0] || null;
     }
 
-    // ---- 5) Previous counter (pubkey-first, UUID fallback) ----
+    // ---- 5) Previous counter + previous scan time (pubkey-first, UUID fallback) ----
     let lastCounter = null;
 
     if (has_identity) {
@@ -377,25 +377,31 @@ router.post("/", requireAuth, async (req, res) => {
       if (keys.length) {
         const cRes = await query(
           `
-          SELECT counter
+          SELECT counter, created_at
           FROM scan_events
           WHERE id <> $1
             AND (
-              raw_json->>'pubkey_hex' = ANY($2::text[])
+              UPPER(raw_json->>'pubkey_hex') = ANY($2::text[])
             )
           ORDER BY created_at DESC
           LIMIT 1;
           `,
           [scanRow.id, keys]
         );
-        lastCounter = cRes.rows[0]?.counter ?? null;
+
+        lastCounter = cRes.rows[0]
+          ? {
+              counter: cRes.rows[0].counter ?? null,
+              created_at: cRes.rows[0].created_at ?? null
+            }
+          : null;
       }
     }
 
     if (lastCounter === null && uuid) {
       const cRes = await query(
         `
-        SELECT counter
+        SELECT counter, created_at
         FROM scan_events
         WHERE uuid = $1
           AND id <> $2
@@ -404,41 +410,31 @@ router.post("/", requireAuth, async (req, res) => {
         `,
         [uuid, scanRow.id]
       );
-      lastCounter = cRes.rows[0]?.counter ?? null;
+
+      lastCounter = cRes.rows[0]
+        ? {
+            counter: cRes.rows[0].counter ?? null,
+            created_at: cRes.rows[0].created_at ?? null
+          }
+        : null;
     }
 
     // ---- 6) Run fusion brain ----
-    const scanEventForFusion = has_identity
-      ? {
-          plate: observedPlate || null,
-          uuid: uuid || null,
-          counter,
-          sig_valid,
-          chal_valid,
-          pubkey_match,
-          tamper: tamper_flag,
-          rssi,
-          est_distance_m,
-          cloud_verdict,
-          scanner_result,
-          has_identity,
-          created_at: scanRow.created_at
-        }
-      : {
-          plate: observedPlate || null,
-          uuid: uuid || null,
-          counter,
-          sig_valid,
-          chal_valid,
-          pubkey_match,
-          tamper: tamper_flag,
-          rssi,
-          est_distance_m,
-          cloud_verdict,
-          scanner_result,
-          has_identity: false,
-          created_at: scanRow.created_at
-        };
+    const scanEventForFusion = {
+      plate: observedPlate || null,
+      uuid: uuid || null,
+      counter,
+      sig_valid,
+      chal_valid,
+      pubkey_match,
+      tamper: tamper_flag,
+      rssi,
+      est_distance_m,
+      cloud_verdict,
+      scanner_result,
+      has_identity,
+      created_at: scanRow.created_at
+    };
 
     let matchDeltaMs = null;
     if (anprEvent?.ts) {
@@ -504,14 +500,16 @@ router.post("/", requireAuth, async (req, res) => {
         scanner_result,
         has_identity,
         observed_pubkey_hex: observedPubkeyHex || null,
-        pubkey_match
+        pubkey_match,
+        last_counter: lastCounter?.counter ?? null,
+        last_seen_at: lastCounter?.created_at ?? null
       }
     };
 
     const fusionRes = await query(fusionSql, [
       fusion.plate,
-      scanRow.id,                 // legacy scan_id
-      scanRow.id,                 // new scan_event_id
+      scanRow.id, // legacy scan_id
+      scanRow.id, // new scan_event_id
       anprEvent?.id ?? null,
       aiEvent?.id ?? null,
       matchDeltaMs,
