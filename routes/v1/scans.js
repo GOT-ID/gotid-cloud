@@ -91,7 +91,8 @@ const scanner_result_in =
 
 let scanner_result = scanner_result_in;
 
-if (!scanner_result) {
+// 🔥 FIX: treat UNKNOWN as not valid input
+if (!scanner_result || scanner_result === "UNKNOWN") {
   if (tamper_flag) {
     scanner_result = "TAMPERED";
   } else if (!sig_valid) {
