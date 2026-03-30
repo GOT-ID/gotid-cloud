@@ -9,6 +9,8 @@ const router = Router();
 const SIGN_WINDOW_SEC = 20;
 // Suppress duplicate contradictory ANPR-led alerts for the same plate/pass
 const PASS_DEDUP_SEC = 12;
+// Suppress camera-led UUID_MISSING if the same plate was recently authenticated
+const RECENT_MATCH_SUPPRESS_SEC = 25;
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -170,18 +172,18 @@ router.post("/", requireAuth, async (req, res) => {
       if (scanRes.rows.length === 0) {
         // Suppress UUID_MISSING if the same plate already got a recent positive authenticated outcome
         const recentMatchRes = await query(
-          `
-          SELECT id
-          FROM fusion_events
-          WHERE plate = $1
-            AND final_label IN ('MATCH_STRONG', 'MATCH_WEAK_VISUAL')
-            AND created_at > (to_timestamp($2) - interval '${PASS_DEDUP_SEC} seconds')
-            AND created_at < (to_timestamp($2) + interval '${PASS_DEDUP_SEC} seconds')
-          ORDER BY created_at DESC
-          LIMIT 1;
-          `,
-          [p, tsSeconds]
-        );
+  `
+  SELECT id
+  FROM fusion_events
+  WHERE plate = $1
+    AND fusion_verdict = 'MATCH'
+    AND created_at >= (to_timestamp($2) - interval '${RECENT_MATCH_SUPPRESS_SEC} seconds')
+    AND created_at <= to_timestamp($2)
+  ORDER BY created_at DESC
+  LIMIT 1;
+  `,
+  [p, tsSeconds]
+);
 
         if (recentMatchRes.rows.length === 0) {
           // De-dupe repeated ANPR alerts
