@@ -82,12 +82,28 @@ router.post("/", requireAuth, async (req, res) => {
     const uuid = asStr(body.uuid, MAX_UUID_LEN, null);
     const counter = clampInt(body.counter ?? 0, 0, 2_000_000_000, 0);
 
-    const sig_valid = asBool(body.sig_valid, true);
-    const chal_valid = asBool(body.chal_valid, true);
-    const tamper_flag = asBool(body.tamper ?? body.tamper_flag, false);
+const sig_valid = asBool(body.sig_valid, false);
+const chal_valid = asBool(body.chal_valid, false);
+const tamper_flag = asBool(body.tamper ?? body.tamper_flag, false);
 
-    const scanner_result =
-      (asStr(body.result, 32, "UNKNOWN") || "UNKNOWN").toUpperCase().trim();
+const scanner_result_in =
+  (asStr(body.result ?? body.verdict, 32, "") || "").toUpperCase().trim();
+
+let scanner_result = scanner_result_in;
+
+if (!scanner_result) {
+  if (tamper_flag) {
+    scanner_result = "TAMPERED";
+  } else if (!sig_valid) {
+    scanner_result = "INVALID_TAG";
+  } else if (sig_valid && !chal_valid) {
+    scanner_result = "RELAY_SUSPECT";
+  } else if (sig_valid && chal_valid) {
+    scanner_result = "MATCH";
+  } else {
+    scanner_result = "UNKNOWN";
+  }
+}
 
     const pubkey_match =
       body.pubkey_match === undefined || body.pubkey_match === null
