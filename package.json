@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "worker:fusion": "node workers/fusion_adjudicator.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
