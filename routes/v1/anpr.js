@@ -5,8 +5,7 @@ import { query } from "../../db/index.js";
 
 const router = Router();
 
-// Keep these for now as shared policy values / future use.
-// UUID_MISSING will be handled by the pass adjudicator later, not here.
+// Shared policy values
 const SIGN_WINDOW_SEC = 20;
 const PASS_DEDUP_SEC = 12;
 const RECENT_MATCH_SUPPRESS_SEC = 25;
@@ -72,9 +71,7 @@ router.post("/", requireAuth, async (req, res) => {
 
     const camId = camera_id || "C920_CAM";
 
-    // 0) REGISTRY GATE
-    // Keep this here because the ANPR anchor should still know whether
-    // the vehicle is enrolled / expected to have GOT-ID.
+    // 0) Registry lookup for debug/audit context only
     const regRes = await query(
       `
       SELECT plate, status, gotid_uuid, public_key, raw_json, make, model, colour, vin
@@ -95,26 +92,26 @@ router.post("/", requireAuth, async (req, res) => {
     const registryStatus = reg?.status || "UNKNOWN";
 
     // 1) Insert ANPR event
-    const insertAnprSql = `
+    const anprInsertRes = await query(
+      `
       INSERT INTO anpr_events (
         plate, ts, camera_id, confidence, raw_json
       )
       VALUES ($1, to_timestamp($2), $3, $4, $5)
       RETURNING id, ts;
-    `;
+      `,
+      [
+        p,
+        tsSeconds,
+        camId,
+        confidence ?? 0.9,
+        raw || req.body
+      ]
+    );
 
-    const insertAnprParams = [
-      p,
-      tsSeconds,
-      camId,
-      confidence ?? 0.9,
-      raw || req.body
-    ];
-
-    const anprInsertRes = await query(insertAnprSql, insertAnprParams);
     const row = anprInsertRes.rows[0];
 
-    // 2) Find nearest AI event within ±10 seconds
+    // 2) Optional nearest AI lookup for response/debug only
     const aiRes = await query(
       `
       SELECT *
@@ -138,13 +135,17 @@ router.post("/", requireAuth, async (req, res) => {
     const aiEvent = aiRes.rows[0] || null;
     const aiConfidence = getAiConfidence(aiEvent);
 
-    // IMPORTANT:
-    // Do NOT create UUID_MISSING here.
-    // This route is now ANPR ingestion + anchor creation only.
-    // Final absence adjudication must happen later, after the full
-    // allowed window has actually expired.
+    // 3) Enqueue durable pass adjudication job
+    await query(
+      `
+      INSERT INTO fusion_jobs (anpr_id, due_at, status)
+      VALUES ($1, to_timestamp($2) + ($3 * interval '1 second'), 'PENDING')
+      ON CONFLICT (anpr_id) DO NOTHING;
+      `,
+      [row.id, tsSeconds, SIGN_WINDOW_SEC]
+    );
 
-    // Always return success for ANPR ingestion
+    // 4) Return success for ingestion only
     res.status(201).json({
       ok: true,
       anpr_id: row.id,
@@ -154,8 +155,6 @@ router.post("/", requireAuth, async (req, res) => {
       registry_status: registryStatus,
       ai_linked: !!aiEvent,
       ai_id: aiEvent?.id ?? null,
-
-      // Helpful debug / audit fields for now
       ai_confidence: aiConfidence,
       policy: {
         sign_window_sec: SIGN_WINDOW_SEC,
