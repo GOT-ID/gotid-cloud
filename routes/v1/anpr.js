@@ -5,11 +5,10 @@ import { query } from "../../db/index.js";
 
 const router = Router();
 
-// How long after ANPR we wait for a GOT-ID scan before declaring UUID_MISSING
+// Keep these for now as shared policy values / future use.
+// UUID_MISSING will be handled by the pass adjudicator later, not here.
 const SIGN_WINDOW_SEC = 20;
-// Suppress duplicate contradictory ANPR-led alerts for the same plate/pass
 const PASS_DEDUP_SEC = 12;
-// Suppress camera-led UUID_MISSING if the same plate was recently authenticated
 const RECENT_MATCH_SUPPRESS_SEC = 25;
 
 function normPlate(p) {
@@ -74,7 +73,8 @@ router.post("/", requireAuth, async (req, res) => {
     const camId = camera_id || "C920_CAM";
 
     // 0) REGISTRY GATE
-    // Only enrolled vehicles that actually have GOT-ID should create UUID_MISSING.
+    // Keep this here because the ANPR anchor should still know whether
+    // the vehicle is enrolled / expected to have GOT-ID.
     const regRes = await query(
       `
       SELECT plate, status, gotid_uuid, public_key, raw_json, make, model, colour, vin
@@ -138,153 +138,11 @@ router.post("/", requireAuth, async (req, res) => {
     const aiEvent = aiRes.rows[0] || null;
     const aiConfidence = getAiConfidence(aiEvent);
 
-    // 3) UUID_MISSING creation logic (police-grade)
-    // Only if:
-    //  - plate is ENROLLED
-    //  - has_gotid === true
-    //  - no VALID identity scan_event arrives within ±SIGN_WINDOW_SEC
-    if (reg && hasGotId === true) {
-      const scanRes = await query(
-        `
-        SELECT
-          id,
-          created_at,
-          result,
-          plate,
-          sig_valid,
-          chal_valid,
-          raw_json
-        FROM scan_events
-        WHERE plate = $1
-          AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
-          AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
-          AND (
-            NULLIF(raw_json->>'pubkey_hex', '') IS NOT NULL
-            OR sig_valid = true
-            OR chal_valid = true
-          )
-        ORDER BY created_at DESC
-        LIMIT 1;
-        `,
-        [p, tsSeconds]
-      );
-
-      if (scanRes.rows.length === 0) {
-        // Suppress UUID_MISSING if the same plate already got a recent positive authenticated outcome
-        const recentMatchRes = await query(
-  `
-  SELECT id
-  FROM fusion_events
-  WHERE plate = $1
-    AND fusion_verdict = 'MATCH'
-    AND created_at >= (to_timestamp($2) - interval '${RECENT_MATCH_SUPPRESS_SEC} seconds')
-    AND created_at <= to_timestamp($2)
-  ORDER BY created_at DESC
-  LIMIT 1;
-  `,
-  [p, tsSeconds]
-);
-
-        if (recentMatchRes.rows.length === 0) {
-          // De-dupe repeated ANPR alerts
-          const existsRes = await query(
-            `
-            SELECT id
-            FROM fusion_events
-            WHERE plate = $1
-              AND scan_id IS NULL
-              AND fusion_verdict = 'UUID_MISSING'
-              AND created_at > (to_timestamp($2) - interval '${SIGN_WINDOW_SEC} seconds')
-              AND created_at < (to_timestamp($2) + interval '${SIGN_WINDOW_SEC} seconds')
-            ORDER BY created_at DESC
-            LIMIT 1;
-            `,
-            [p, tsSeconds]
-          );
-
-          if (existsRes.rows.length === 0) {
-            let visualConfidence = "WEAK";
-            if ((confidence ?? 0) >= 0.9 || (aiConfidence ?? 0) >= 0.9) {
-              visualConfidence = "STRONG";
-            } else if ((confidence ?? 0) >= 0.7 || (aiConfidence ?? 0) >= 0.7) {
-              visualConfidence = "MEDIUM";
-            }
-
-            const reasons = [
-              "Enrolled vehicle seen by ANPR but no valid GOT-ID identity was captured within window."
-            ];
-
-            if (aiEvent) {
-              reasons.push("AI camera evidence also present near the same timestamp.");
-            }
-
-            await query(
-              `
-              INSERT INTO fusion_events (
-                plate,
-                scan_id,
-                scan_event_id,
-                anpr_id,
-                ai_id,
-                match_delta_ms,
-                fusion_verdict,
-                final_label,
-                visual_confidence,
-                has_gotid,
-                registry_status,
-                reasons,
-                raw_json
-              )
-              VALUES ($1, NULL, NULL, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10);
-              `,
-              [
-                p,
-                row.id,
-                aiEvent?.id ?? null,
-                "UUID_MISSING",
-                visualConfidence === "STRONG" || visualConfidence === "MEDIUM"
-                  ? "CLONE_MISSING_TAG_STRONG"
-                  : "CLONE_MISSING_TAG_WEAK",
-                visualConfidence,
-                true,
-                registryStatus,
-                reasons,
-                {
-                  evidence_type: "ANPR_LED_UUID_MISSING",
-                  anpr_id: row.id,
-                  ai_id: aiEvent?.id ?? null,
-                  plate: p,
-                  ts: row.ts,
-                  camera_id: camId,
-                  anpr_confidence: confidence ?? null,
-                  ai_vehicle_conf: aiConfidence,
-                  ai_vehicle_type:
-                    aiEvent?.vehicle_type ||
-                    aiEvent?.raw_json?.vehicle_type ||
-                    aiEvent?.raw_json?.yolo_class_name ||
-                    null,
-                  ai_colour:
-                    aiEvent?.colour ||
-                    aiEvent?.raw_json?.colour_estimate ||
-                    null,
-                  registry_status: registryStatus,
-                  has_gotid: true,
-                  vehicle: reg
-                    ? {
-                        plate: reg.plate,
-                        vin: reg.vin,
-                        make: reg.make,
-                        model: reg.model,
-                        colour: reg.colour
-                      }
-                    : null
-                }
-              ]
-            );
-          }
-        }
-      }
-    }
+    // IMPORTANT:
+    // Do NOT create UUID_MISSING here.
+    // This route is now ANPR ingestion + anchor creation only.
+    // Final absence adjudication must happen later, after the full
+    // allowed window has actually expired.
 
     // Always return success for ANPR ingestion
     res.status(201).json({
@@ -295,7 +153,15 @@ router.post("/", requireAuth, async (req, res) => {
       has_gotid: hasGotId === true,
       registry_status: registryStatus,
       ai_linked: !!aiEvent,
-      ai_id: aiEvent?.id ?? null
+      ai_id: aiEvent?.id ?? null,
+
+      // Helpful debug / audit fields for now
+      ai_confidence: aiConfidence,
+      policy: {
+        sign_window_sec: SIGN_WINDOW_SEC,
+        pass_dedup_sec: PASS_DEDUP_SEC,
+        recent_match_suppress_sec: RECENT_MATCH_SUPPRESS_SEC
+      }
     });
   } catch (err) {
     console.error("Error in POST /v1/anpr:", err);
