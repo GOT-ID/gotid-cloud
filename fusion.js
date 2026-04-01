@@ -105,7 +105,14 @@ function toMs(ts) {
   return Number.isFinite(t) ? t : null;
 }
 
-export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, lastCounter }) {
+export function decideFusion({
+  registryVehicle,
+  scanEvent,
+  anprEvent,
+  aiEvent,
+  lastCounter,
+  allowMissingDecision = false
+}) {
   const cloudVerdict = scanEvent?.cloud_verdict || null;
   const scannerResult = scanEvent?.scanner_result || null;
 
@@ -196,45 +203,51 @@ export function decideFusion({ registryVehicle, scanEvent, anprEvent, aiEvent, l
       }
     } else {
       if (!scanEvent || !hasIdentity) {
-        fused.fusion_verdict = "UUID_MISSING";
-        fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
+        if (allowMissingDecision === true) {
+          fused.fusion_verdict = "UUID_MISSING";
+          fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
+        } else {
+          fused.fusion_verdict = "PENDING";
+          fused.reasons.push("Enrolled vehicle pass is still awaiting identity evidence before deadline.");
+        }
       } else {
-       const DUP_WINDOW_S = 35;
-const REPLAY_WINDOW_S = 120;
+        const DUP_WINDOW_S = 35;
+        const REPLAY_WINDOW_S = 120;
 
-const prevCounter =
-  typeof lastCounter === "object" ? lastCounter?.counter : lastCounter;
-const prevTs =
-  typeof lastCounter === "object" ? lastCounter?.created_at : null;
+        const prevCounter =
+          typeof lastCounter === "object" ? lastCounter?.counter : lastCounter;
+        const prevTs =
+          typeof lastCounter === "object" ? lastCounter?.created_at : null;
 
-if (typeof prevCounter === "number" && typeof scanEvent.counter === "number") {
-  if (scanEvent.counter < prevCounter) {
-    fused.fusion_verdict = "COUNTER_ROLLBACK";
-    fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
-  } else if (scanEvent.counter === prevCounter) {
-    const currentTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
-    const previousTs = toMs(prevTs);
-    const gapS =
-      currentTs !== null && previousTs !== null
-        ? Math.abs(currentTs - previousTs) / 1000
-        : null;
+        if (typeof prevCounter === "number" && typeof scanEvent.counter === "number") {
+          if (scanEvent.counter < prevCounter) {
+            fused.fusion_verdict = "COUNTER_ROLLBACK";
+            fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
+          } else if (scanEvent.counter === prevCounter) {
+            const currentTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
+            const previousTs = toMs(prevTs);
+            const gapS =
+              currentTs !== null && previousTs !== null
+                ? Math.abs(currentTs - previousTs) / 1000
+                : null;
 
-    if (gapS !== null && gapS <= DUP_WINDOW_S) {
-      fused.reasons.push(
-        `Same counter re-seen after ${Math.round(gapS)}s (benign duplicate live sighting).`
-      );
-    } else if (gapS !== null && gapS > REPLAY_WINDOW_S) {
-      fused.fusion_verdict = "REPLAY_SUSPECT";
-      fused.reasons.push(
-        `Counter repeated after ${Math.round(gapS)}s since previous scan (possible replay).`
-      );
-    } else {
-      fused.reasons.push(
-        `Same counter repeated after ${Math.round(gapS)}s (still treated as live duplicate, broadcaster rotates every ~30s).`
-      );
-    }
-  }
-}
+            if (gapS !== null && gapS <= DUP_WINDOW_S) {
+              fused.reasons.push(
+                `Same counter re-seen after ${Math.round(gapS)}s (benign duplicate live sighting).`
+              );
+            } else if (gapS !== null && gapS > REPLAY_WINDOW_S) {
+              fused.fusion_verdict = "REPLAY_SUSPECT";
+              fused.reasons.push(
+                `Counter repeated after ${Math.round(gapS)}s since previous scan (possible replay).`
+              );
+            } else {
+              fused.reasons.push(
+                `Same counter repeated after ${Math.round(gapS)}s (still treated as live duplicate, broadcaster rotates every ~30s).`
+              );
+            }
+          }
+        }
+
         if (!fused.fusion_verdict) {
           if (scanEvent.sig_valid === false) {
             fused.fusion_verdict = "INVALID_TAG";
@@ -321,6 +334,8 @@ if (typeof prevCounter === "number" && typeof scanEvent.counter === "number") {
       fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
         ? "MATCH_STRONG"
         : "MATCH_WEAK_VISUAL";
+  } else if (v === "PENDING") {
+    fused.final_label = "PENDING";
   } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
     fused.final_label =
       fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
