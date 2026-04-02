@@ -1,5 +1,5 @@
 import { query } from "../db/index.js";
-import { decideFusion } from "../routes/v1/fusion.js";
+import { decideFusion } from "./fusion.js";
 
 const SIGN_WINDOW_SEC = 20;
 const LOOP_INTERVAL_MS = 2000;
