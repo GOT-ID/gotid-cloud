@@ -1,7 +1,6 @@
 import { query } from "../db/index.js";
 import { decideFusion } from "../fusion.js";
 
-
 const SIGN_WINDOW_SEC = 20;
 const LOOP_INTERVAL_MS = 2000;
 
@@ -82,21 +81,23 @@ async function processSingleJob(job) {
       SELECT *
       FROM scan_events
       WHERE plate = $1
-        AND created_at BETWEEN $2 AND ($2 + interval '${SIGN_WINDOW_SEC} seconds')
+        AND created_at BETWEEN $2::timestamptz
+                          AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
       ORDER BY created_at ASC
       LIMIT 1
       `,
-      [anpr.plate, anpr.ts]
+      [anpr.plate, anpr.ts, SIGN_WINDOW_SEC]
     );
 
     const scan = scanRes.rows[0] || null;
 
-    // 3) Load nearest AI event
+    // 3) Load nearest AI event around the ANPR timestamp
     const aiRes = await query(
       `
       SELECT *
       FROM ai_events
-      WHERE ts BETWEEN ($1 - interval '10 seconds') AND ($1 + interval '10 seconds')
+      WHERE ts BETWEEN ($1::timestamptz - INTERVAL '10 seconds')
+                   AND ($1::timestamptz + INTERVAL '10 seconds')
         AND (
           plate = $2
           OR plate IS NULL
@@ -104,7 +105,7 @@ async function processSingleJob(job) {
         )
       ORDER BY
         CASE WHEN plate = $2 THEN 0 ELSE 1 END,
-        ABS(EXTRACT(EPOCH FROM (ts - $1))) ASC
+        ABS(EXTRACT(EPOCH FROM (ts - $1::timestamptz))) ASC
       LIMIT 1
       `,
       [anpr.ts, anpr.plate]
