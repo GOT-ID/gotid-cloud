@@ -130,7 +130,7 @@ export function decideFusion({
     reasons: [],
     plate: anprEvent?.plate || scanEvent?.plate || registryVehicle?.plate || null,
 
-    has_gotid: registryVehicle ? (registryVehicle.has_gotid ?? true) : false,
+    has_gotid: registryVehicle ? (registryVehicle.has_gotid === true) : false,
     registry_status: registryVehicle?.status || "unknown",
 
     crypto: {
