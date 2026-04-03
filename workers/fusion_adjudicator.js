@@ -10,6 +10,7 @@ const PASS_IDLE_FINALISE_SEC = 30;    // if no new ANPR for this long, pass can 
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
 const MISSING_OBSERVATION_SEC = 25;    // must wait this long before UUID_MISSING finalises
+const PASS_RECENT_FINALISED_REUSE_SEC = 45;
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
 
@@ -371,6 +372,7 @@ async function processSingleJob(job) {
 }
 
 async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
+  // 1) Prefer an existing OPEN pass for the same plate close to this ANPR timestamp
   const openRes = await query(
     `
     SELECT *
@@ -388,6 +390,41 @@ async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
     return openRes.rows[0];
   }
 
+  // 2) If there is no OPEN pass, try to REUSE / REOPEN a very recent FINALISED pass
+  // for the same plate when the ANPR timestamp still falls within continuity.
+  const recentFinalisedRes = await query(
+    `
+    SELECT *
+    FROM fusion_passes
+    WHERE plate = $1
+      AND pass_status = 'FINALISED'
+      AND last_seen_at >= ($2::timestamptz - ($3 * INTERVAL '1 second'))
+    ORDER BY last_seen_at DESC
+    LIMIT 1
+    `,
+    [plate, anpr.ts, PASS_RECENT_FINALISED_REUSE_SEC]
+  );
+
+  if (recentFinalisedRes.rows.length) {
+    const recentPass = recentFinalisedRes.rows[0];
+
+    const reopened = await query(
+      `
+      UPDATE fusion_passes
+      SET
+        pass_status = 'OPEN',
+        finalised_at = NULL,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [recentPass.id]
+    );
+
+    return reopened.rows[0];
+  }
+
+  // 3) Otherwise create a brand new pass
   const insertRes = await query(
     `
     INSERT INTO fusion_passes (
