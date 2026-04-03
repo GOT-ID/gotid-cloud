@@ -6,7 +6,7 @@ const LOOP_INTERVAL_MS = 2000;
 
 // Pass/session timing
 const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same pass
-const PASS_IDLE_FINALISE_SEC = 20;      // if no new ANPR for this long, pass can finalise
+const PASS_IDLE_FINALISE_SEC = 30;    // if no new ANPR for this long, pass can finalise
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
 const MISSING_OBSERVATION_SEC = 25;    // must wait this long before UUID_MISSING finalises
@@ -349,16 +349,9 @@ async function processSingleJob(job) {
       provisional
     });
 
-    // 10) Finalise if mature enough
-    const finalised = await tryFinalisePass({
-      passId: pass.id,
-      latestAnpr: anpr,
-      latestAi: ai,
-      latestScan: scan,
-      registryVehicle,
-      scanEventForFusion,
-      provisional
-    });
+   // 10) Do not finalise inside the live job handler.
+    // Finalisation should only happen from the background maturity sweep.
+    const finalised = null;
 
     // 11) Mark job complete
     await query(
