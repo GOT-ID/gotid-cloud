@@ -209,16 +209,17 @@ async function processSingleJob(job) {
     if (scan) {
       if (keys.length) {
         const cRes = await query(
-          `
-          SELECT counter, created_at
-          FROM scan_events
-          WHERE id <> $1
-            AND UPPER(raw_json->>'pubkey_hex') = ANY($2::text[])
-          ORDER BY created_at DESC
-          LIMIT 1
-          `,
-          [scan.id, keys]
-        );
+  `
+  SELECT counter, created_at
+  FROM scan_events
+  WHERE id <> $1
+    AND created_at < $3::timestamptz
+    AND UPPER(raw_json->>'pubkey_hex') = ANY($2::text[])
+  ORDER BY created_at DESC
+  LIMIT 1
+  `,
+  [scan.id, keys, scan.created_at]
+);
 
         lastCounter = cRes.rows[0]
           ? {
@@ -230,16 +231,17 @@ async function processSingleJob(job) {
 
       if (lastCounter === null && scan.uuid) {
         const cRes = await query(
-          `
-          SELECT counter, created_at
-          FROM scan_events
-          WHERE uuid = $1
-            AND id <> $2
-          ORDER BY created_at DESC
-          LIMIT 1
-          `,
-          [scan.uuid, scan.id]
-        );
+  `
+  SELECT counter, created_at
+  FROM scan_events
+  WHERE uuid = $1
+    AND id <> $2
+    AND created_at < $3::timestamptz
+  ORDER BY created_at DESC
+  LIMIT 1
+  `,
+  [scan.uuid, scan.id, scan.created_at]
+);
 
         lastCounter = cRes.rows[0]
           ? {
