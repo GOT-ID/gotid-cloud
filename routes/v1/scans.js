@@ -129,7 +129,8 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     // Identity is only truly present if we captured public-key identity proof
-    const has_identity = !!observedPubkeyHex;
+    // AND the base signature was valid.
+    const has_identity = !!observedPubkeyHex && sig_valid === true;
 
     // ---- 1) Insert scan_events (forensic record only) ----
     const insertSql = `
