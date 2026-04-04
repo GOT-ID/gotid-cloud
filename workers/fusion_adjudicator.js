@@ -6,11 +6,10 @@ const LOOP_INTERVAL_MS = 2000;
 
 // Pass/session timing
 const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same pass
-const PASS_IDLE_FINALISE_SEC = 30;    // if no new ANPR for this long, pass can finalise
+const PASS_IDLE_FINALISE_SEC = 30;     // if no new ANPR for this long, pass can finalise
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
 const MISSING_OBSERVATION_SEC = 25;    // must wait this long before UUID_MISSING finalises
-const PASS_RECENT_FINALISED_REUSE_SEC = 45;
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
 
@@ -92,6 +91,111 @@ function bestOf(existing, incoming) {
   const a = existing || null;
   const b = incoming || null;
   return (rank[b] ?? -1) > (rank[a] ?? -1) ? b : a;
+}
+
+function deriveScannerResult(scan) {
+  let scanner_result = (scan?.result || "").toUpperCase().trim();
+  const sig_valid = asBool(scan?.sig_valid, false);
+  const chal_valid = asBool(scan?.chal_valid, false);
+  const tamper_flag = asBool(scan?.tamper_flag, false);
+
+  if (!scanner_result || scanner_result === "UNKNOWN") {
+    if (tamper_flag) {
+      scanner_result = "TAMPERED";
+    } else if (!sig_valid) {
+      scanner_result = "INVALID_TAG";
+    } else if (sig_valid && !chal_valid) {
+      scanner_result = "RELAY_SUSPECT";
+    } else if (sig_valid && chal_valid) {
+      scanner_result = "MATCH";
+    } else {
+      scanner_result = "UNKNOWN";
+    }
+  }
+
+  return scanner_result;
+}
+
+function derivePubkeyMatch({ observedPubkeyHex, registryVehicle }) {
+  if (!observedPubkeyHex) return null;
+  if (!registryVehicle) return false;
+
+  const regPubkey = normHex(registryVehicle.public_key || "");
+  if (!regPubkey) return false;
+
+  const candidates = pubkeyCandidates(observedPubkeyHex);
+  return candidates.includes(regPubkey);
+}
+
+function buildCloudVerdict({
+  has_identity,
+  registryVehicle,
+  scan,
+  scanner_result
+}) {
+  if (!has_identity) {
+    return registryVehicle ? null : "UNREGISTERED_VEHICLE";
+  }
+
+  if (!registryVehicle) {
+    return "UNREGISTERED_IDENTITY";
+  }
+
+  const assignedPlate = normPlate(registryVehicle.plate);
+  const observedPlate = normPlate(scan?.plate);
+
+  if (observedPlate && assignedPlate && observedPlate !== assignedPlate) {
+    return "MISMATCH";
+  } else if (scanner_result === "REPLAY_SUSPECT") {
+    return "REPLAY_SUSPECT";
+  } else if (scanner_result === "INVALID_TAG") {
+    return "INVALID_TAG";
+  } else if (scanner_result === "CLONE_SUSPECT") {
+    return "KEY_MISMATCH";
+  } else if (scanner_result === "RELAY_SUSPECT") {
+    return "RELAY_SUSPECT";
+  } else if (scanner_result === "TAMPERED") {
+    return "TAMPERED";
+  } else if (scanner_result === "MATCH") {
+    return "AUTHENTIC";
+  }
+
+  return null;
+}
+
+function buildScanEventForFusion(scan, registryVehicle) {
+  if (!scan) return null;
+
+  const observedPubkeyHex = normHex(scan.raw_json?.pubkey_hex || "");
+  const sig_valid = asBool(scan.sig_valid, false);
+  const chal_valid = asBool(scan.chal_valid, false);
+  const tamper_flag = asBool(scan.tamper_flag, false);
+  const scanner_result = deriveScannerResult(scan);
+  const has_identity = !!observedPubkeyHex && sig_valid === true;
+  const pubkey_match = derivePubkeyMatch({ observedPubkeyHex, registryVehicle });
+  const cloud_verdict = buildCloudVerdict({
+    has_identity,
+    registryVehicle,
+    scan,
+    scanner_result
+  });
+
+  return {
+    id: scan.id,
+    plate: scan.plate || null,
+    uuid: scan.uuid || null,
+    counter: scan.counter ?? null,
+    sig_valid,
+    chal_valid,
+    pubkey_match,
+    tamper: tamper_flag,
+    rssi: scan.rssi ?? null,
+    est_distance_m: scan.est_distance_m ?? null,
+    cloud_verdict,
+    scanner_result,
+    has_identity,
+    created_at: scan.created_at
+  };
 }
 
 async function processJobs() {
@@ -209,17 +313,17 @@ async function processSingleJob(job) {
     if (scan) {
       if (keys.length) {
         const cRes = await query(
-  `
-  SELECT counter, created_at
-  FROM scan_events
-  WHERE id <> $1
-    AND created_at < $3::timestamptz
-    AND UPPER(raw_json->>'pubkey_hex') = ANY($2::text[])
-  ORDER BY created_at DESC
-  LIMIT 1
-  `,
-  [scan.id, keys, scan.created_at]
-);
+          `
+          SELECT counter, created_at
+          FROM scan_events
+          WHERE id <> $1
+            AND created_at < $3::timestamptz
+            AND UPPER(raw_json->>'pubkey_hex') = ANY($2::text[])
+          ORDER BY created_at DESC
+          LIMIT 1
+          `,
+          [scan.id, keys, scan.created_at]
+        );
 
         lastCounter = cRes.rows[0]
           ? {
@@ -231,17 +335,17 @@ async function processSingleJob(job) {
 
       if (lastCounter === null && scan.uuid) {
         const cRes = await query(
-  `
-  SELECT counter, created_at
-  FROM scan_events
-  WHERE uuid = $1
-    AND id <> $2
-    AND created_at < $3::timestamptz
-  ORDER BY created_at DESC
-  LIMIT 1
-  `,
-  [scan.uuid, scan.id, scan.created_at]
-);
+          `
+          SELECT counter, created_at
+          FROM scan_events
+          WHERE uuid = $1
+            AND id <> $2
+            AND created_at < $3::timestamptz
+          ORDER BY created_at DESC
+          LIMIT 1
+          `,
+          [scan.uuid, scan.id, scan.created_at]
+        );
 
         lastCounter = cRes.rows[0]
           ? {
@@ -253,76 +357,9 @@ async function processSingleJob(job) {
     }
 
     // 6) Build scan event for fusion brain
-    let scanEventForFusion = null;
+    const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
-    if (scan) {
-      const has_identity = !!observedPubkeyHex;
-
-      let scanner_result = (scan.result || "").toUpperCase().trim();
-      const sig_valid = asBool(scan.sig_valid, false);
-      const chal_valid = asBool(scan.chal_valid, false);
-      const tamper_flag = asBool(scan.tamper_flag, false);
-
-      if (!scanner_result || scanner_result === "UNKNOWN") {
-        if (tamper_flag) {
-          scanner_result = "TAMPERED";
-        } else if (!sig_valid) {
-          scanner_result = "INVALID_TAG";
-        } else if (sig_valid && !chal_valid) {
-          scanner_result = "RELAY_SUSPECT";
-        } else if (sig_valid && chal_valid) {
-          scanner_result = "MATCH";
-        } else {
-          scanner_result = "UNKNOWN";
-        }
-      }
-
-      let cloud_verdict = "UUID_MISSING";
-
-      if (!has_identity) {
-        cloud_verdict = registryVehicle ? "UUID_MISSING" : "UNREGISTERED_VEHICLE";
-      } else if (!registryVehicle) {
-        cloud_verdict = "UNREGISTERED_IDENTITY";
-      } else {
-        const assignedPlate = normPlate(registryVehicle.plate);
-        const observedPlate = normPlate(scan.plate);
-
-        if (observedPlate && assignedPlate && observedPlate !== assignedPlate) {
-          cloud_verdict = "MISMATCH";
-        } else if (scanner_result === "REPLAY_SUSPECT") {
-          cloud_verdict = "REPLAY_SUSPECT";
-        } else if (scanner_result === "INVALID_TAG") {
-          cloud_verdict = "INVALID_TAG";
-        } else if (scanner_result === "CLONE_SUSPECT") {
-          cloud_verdict = "KEY_MISMATCH";
-        } else if (scanner_result === "RELAY_SUSPECT") {
-          cloud_verdict = "RELAY_SUSPECT";
-        } else if (scanner_result === "TAMPERED") {
-          cloud_verdict = "TAMPERED";
-        } else {
-          cloud_verdict = "AUTHENTIC";
-        }
-      }
-
-      scanEventForFusion = {
-        id: scan.id,
-        plate: scan.plate || null,
-        uuid: scan.uuid || null,
-        counter: scan.counter ?? null,
-        sig_valid,
-        chal_valid,
-        pubkey_match: null,
-        tamper: tamper_flag,
-        rssi: scan.rssi ?? null,
-        est_distance_m: scan.est_distance_m ?? null,
-        cloud_verdict,
-        scanner_result,
-        has_identity,
-        created_at: scan.created_at
-      };
-    }
-
-    // 7) Open or reuse a pass
+    // 7) Open a pass (never reopen a finalised pass)
     const pass = await getOrCreateOpenPass({
       plate,
       anpr,
@@ -352,7 +389,7 @@ async function processSingleJob(job) {
       provisional
     });
 
-   // 10) Do not finalise inside the live job handler.
+    // 10) Do not finalise inside the live job handler.
     // Finalisation should only happen from the background maturity sweep.
     const finalised = null;
 
@@ -392,41 +429,7 @@ async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
     return openRes.rows[0];
   }
 
-  // 2) If there is no OPEN pass, try to REUSE / REOPEN a very recent FINALISED pass
-  // for the same plate when the ANPR timestamp still falls within continuity.
-  const recentFinalisedRes = await query(
-    `
-    SELECT *
-    FROM fusion_passes
-    WHERE plate = $1
-      AND pass_status = 'FINALISED'
-      AND last_seen_at >= ($2::timestamptz - ($3 * INTERVAL '1 second'))
-    ORDER BY last_seen_at DESC
-    LIMIT 1
-    `,
-    [plate, anpr.ts, PASS_RECENT_FINALISED_REUSE_SEC]
-  );
-
-  if (recentFinalisedRes.rows.length) {
-    const recentPass = recentFinalisedRes.rows[0];
-
-    const reopened = await query(
-      `
-      UPDATE fusion_passes
-      SET
-        pass_status = 'OPEN',
-        finalised_at = NULL,
-        updated_at = NOW()
-      WHERE id = $1
-      RETURNING *
-      `,
-      [recentPass.id]
-    );
-
-    return reopened.rows[0];
-  }
-
-  // 3) Otherwise create a brand new pass
+  // 2) Otherwise create a brand new pass
   const insertRes = await query(
     `
     INSERT INTO fusion_passes (
@@ -482,9 +485,11 @@ async function updatePassWithEvidence({ pass, anpr, ai, scan, registryVehicle, p
 
   const strongestCryptoState = bestOf(
     p.strongest_crypto_state,
-    provisional.fusion_verdict === "MATCH" ? "MATCH" :
-    isStrongSuspicion(provisional.fusion_verdict) ? provisional.fusion_verdict :
-    null
+    provisional.fusion_verdict === "MATCH"
+      ? "MATCH"
+      : isStrongSuspicion(provisional.fusion_verdict)
+        ? provisional.fusion_verdict
+        : null
   );
 
   const strongestCounterState =
@@ -587,12 +592,12 @@ async function tryFinalisePass({
       allowMissingDecision: false
     });
   } else if (
-  hasStrongSuspicion &&
-  passAge !== null &&
-  passAge >= SUSPICION_STABILISE_SEC &&
-  idleAge !== null &&
-  idleAge >= PASS_IDLE_FINALISE_SEC
-) {
+    hasStrongSuspicion &&
+    passAge !== null &&
+    passAge >= SUSPICION_STABILISE_SEC &&
+    idleAge !== null &&
+    idleAge >= PASS_IDLE_FINALISE_SEC
+  ) {
     finalFusion = {
       fusion_verdict: strongest,
       final_label: strongest,
@@ -645,28 +650,18 @@ async function tryFinalisePass({
     finalFusion.fusion_verdict === "MISMATCH_PUBKEY"
   ) {
     finalFusion.final_label = "CLONE_SUSPECT";
-  } else if (
-    finalFusion.fusion_verdict === "INVALID_TAG"
-  ) {
+  } else if (finalFusion.fusion_verdict === "INVALID_TAG") {
     finalFusion.final_label = "INVALID_TAG";
-  } else if (
-    finalFusion.fusion_verdict === "RELAY_SUSPECT"
-  ) {
+  } else if (finalFusion.fusion_verdict === "RELAY_SUSPECT") {
     finalFusion.final_label = "RELAY_SUSPECT";
-  } else if (
-    finalFusion.fusion_verdict === "TAMPER"
-  ) {
+  } else if (finalFusion.fusion_verdict === "TAMPER") {
     finalFusion.final_label =
       pass.visual_confidence === "STRONG" || pass.visual_confidence === "MEDIUM"
         ? "TAMPER_STRONG"
         : "TAMPER_WEAK";
-  } else if (
-    finalFusion.fusion_verdict === "NOT_ENROLLED"
-  ) {
+  } else if (finalFusion.fusion_verdict === "NOT_ENROLLED") {
     finalFusion.final_label = "NOT_ENROLLED";
-  } else if (
-    finalFusion.fusion_verdict === "UNKNOWN_TAG"
-  ) {
+  } else if (finalFusion.fusion_verdict === "UNKNOWN_TAG") {
     finalFusion.final_label = "UNREGISTERED_IDENTITY";
   }
 
@@ -764,25 +759,7 @@ async function finaliseMatureOpenPasses() {
       const ai = aiRes.rows[0] || null;
       const registryVehicle = regRes.rows[0] || null;
 
-      let scanEventForFusion = null;
-      if (scan) {
-        scanEventForFusion = {
-          id: scan.id,
-          plate: scan.plate || null,
-          uuid: scan.uuid || null,
-          counter: scan.counter ?? null,
-          sig_valid: asBool(scan.sig_valid, false),
-          chal_valid: asBool(scan.chal_valid, false),
-          pubkey_match: null,
-          tamper: asBool(scan.tamper_flag, false),
-          rssi: scan.rssi ?? null,
-          est_distance_m: scan.est_distance_m ?? null,
-          cloud_verdict: scan.cloud_verdict || null,
-          scanner_result: (scan.result || "").toUpperCase().trim(),
-          has_identity: true,
-          created_at: scan.created_at
-        };
-      }
+      const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
       await tryFinalisePass({
         passId: pass.id,
