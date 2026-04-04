@@ -117,11 +117,8 @@ export function decideFusion({
   const scannerResult = scanEvent?.scanner_result || null;
 
   const hasIdentity =
-    scanEvent?.has_identity === true ||
-    scanEvent?.pubkey_match === true ||
-    scanEvent?.sig_valid === true ||
-    scanEvent?.chal_valid === true ||
-    (scanEvent?.uuid && String(scanEvent.uuid).trim().length > 0);
+  scanEvent?.has_identity === true ||
+  scanEvent?.pubkey_match === true;
 
   const fused = {
     fusion_verdict: null,
@@ -249,23 +246,26 @@ export function decideFusion({
         }
 
         if (!fused.fusion_verdict) {
-          if (scanEvent.sig_valid === false) {
-            fused.fusion_verdict = "INVALID_TAG";
-            fused.reasons.push("Base signature verification failed.");
-          } else if (scanEvent.chal_valid === false) {
-            fused.fusion_verdict = "RELAY_SUSPECT";
-            fused.reasons.push("Challenge-response failed.");
-          } else if (scanEvent.pubkey_match === false) {
-            fused.fusion_verdict = "MISMATCH_PUBKEY";
-            fused.reasons.push("GOT-ID tag pubkey does not match registry.");
-          } else if (scanEvent.tamper === true) {
-            fused.fusion_verdict = "TAMPER";
-            fused.reasons.push("GOT-ID tag tamper input is active.");
-          } else {
-            fused.fusion_verdict = "MATCH";
-            fused.reasons.push("All cryptographic checks passed and pubkey matches registry.");
-          }
-        }
+  if (scanEvent.sig_valid === false) {
+    fused.fusion_verdict = "INVALID_TAG";
+    fused.reasons.push("Base signature verification failed.");
+  } else if (scanEvent.chal_valid === false) {
+    fused.fusion_verdict = "RELAY_SUSPECT";
+    fused.reasons.push("Challenge-response failed.");
+  } else if (scanEvent.pubkey_match === false) {
+    fused.fusion_verdict = "MISMATCH_PUBKEY";
+    fused.reasons.push("GOT-ID tag pubkey does not match registry.");
+  } else if (scanEvent.tamper === true) {
+    fused.fusion_verdict = "TAMPER";
+    fused.reasons.push("GOT-ID tag tamper input is active.");
+  } else if (scanEvent.sig_valid === true && scanEvent.pubkey_match === true) {
+    fused.fusion_verdict = "MATCH";
+    fused.reasons.push("All cryptographic checks passed and pubkey matches registry.");
+  } else {
+    fused.fusion_verdict = "UNKNOWN_TAG";
+    fused.reasons.push("Identity evidence was present but insufficient to classify as a trusted match.");
+  }
+}
       }
     }
   }
