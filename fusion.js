@@ -245,7 +245,7 @@ export function decideFusion({
           }
         }
 
-        if (!fused.fusion_verdict) {
+    if (!fused.fusion_verdict) {
   if (scanEvent.sig_valid === false) {
     fused.fusion_verdict = "INVALID_TAG";
     fused.reasons.push("Base signature verification failed.");
@@ -258,9 +258,20 @@ export function decideFusion({
   } else if (scanEvent.tamper === true) {
     fused.fusion_verdict = "TAMPER";
     fused.reasons.push("GOT-ID tag tamper input is active.");
-  } else if (scanEvent.sig_valid === true && scanEvent.pubkey_match === true) {
+  } else if (
+    scanEvent.sig_valid === true &&
+    scanEvent.pubkey_match === true &&
+    scanEvent.chal_valid === true
+  ) {
     fused.fusion_verdict = "MATCH";
-    fused.reasons.push("All cryptographic checks passed and pubkey matches registry.");
+    fused.reasons.push("All cryptographic checks passed, pubkey matches registry, and live challenge-response succeeded.");
+  } else if (
+    scanEvent.sig_valid === true &&
+    scanEvent.pubkey_match === true &&
+    scanEvent.chal_valid !== false
+  ) {
+    fused.fusion_verdict = "MATCH_CRYPTO_ONLY";
+    fused.reasons.push("Cryptographic identity passed and pubkey matches registry, but live challenge was not confirmed.");
   } else {
     fused.fusion_verdict = "UNKNOWN_TAG";
     fused.reasons.push("Identity evidence was present but insufficient to classify as a trusted match.");
@@ -336,6 +347,8 @@ export function decideFusion({
         : "MATCH_WEAK_VISUAL";
   } else if (v === "PENDING") {
     fused.final_label = "PENDING";
+    } else if (v === "MATCH_CRYPTO_ONLY") {
+  fused.final_label = "MATCH_CRYPTO_ONLY";    
  } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
   fused.final_label =
     fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
