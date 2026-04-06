@@ -336,12 +336,12 @@ export function decideFusion({
         : "MATCH_WEAK_VISUAL";
   } else if (v === "PENDING") {
     fused.final_label = "PENDING";
-  } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
-    fused.final_label =
-      fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
-        ? "CLONE_MISSING_TAG_STRONG"
-        : "CLONE_MISSING_TAG_WEAK";
-  } else if (v === "MISMATCH" || v === "MISMATCH_PUBKEY") {
+ } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
+  fused.final_label =
+    fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
+      ? "CLONE_SUSPECT_MISSING_TAG_STRONG"
+      : "CLONE_SUSPECT_MISSING_TAG_WEAK";
+} else if (v === "MISMATCH" || v === "MISMATCH_PUBKEY") {
     fused.final_label = "CLONE_SUSPECT";
   } else if (v === "REPLAY_SUSPECT" || v === "COUNTER_ROLLBACK") {
     fused.final_label = "REPLAY_SUSPECT";
