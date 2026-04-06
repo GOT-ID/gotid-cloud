@@ -68,7 +68,27 @@ function isStrongSuspicion(v) {
     "TAMPER"
   ].includes(v);
 }
+function isStrongMatch(scanEvent) {
+  if (!scanEvent) return false;
 
+  return (
+    scanEvent.has_identity === true &&
+    scanEvent.sig_valid === true &&
+    scanEvent.chal_valid === true &&
+    scanEvent.pubkey_match === true &&
+    scanEvent.tamper !== true &&
+    scanEvent.scanner_result !== "REPLAY_SUSPECT" &&
+    scanEvent.scanner_result !== "INVALID_TAG" &&
+    scanEvent.scanner_result !== "RELAY_SUSPECT" &&
+    scanEvent.scanner_result !== "TAMPERED" &&
+    scanEvent.cloud_verdict !== "MISMATCH" &&
+    scanEvent.cloud_verdict !== "KEY_MISMATCH" &&
+    scanEvent.cloud_verdict !== "REPLAY_SUSPECT" &&
+    scanEvent.cloud_verdict !== "INVALID_TAG" &&
+    scanEvent.cloud_verdict !== "RELAY_SUSPECT" &&
+    scanEvent.cloud_verdict !== "TAMPERED"
+  );
+}
 function bestOf(existing, incoming) {
   // Higher number = stronger final truth priority
   const rank = {
@@ -388,10 +408,25 @@ async function processSingleJob(job) {
       registryVehicle,
       provisional
     });
+// 10) Allow early finalisation only for a strong cryptographic MATCH.
+// All other paths still wait for the background maturity sweep.
+let finalised = null;
 
-    // 10) Do not finalise inside the live job handler.
-    // Finalisation should only happen from the background maturity sweep.
-    const finalised = null;
+if (isStrongMatch(scanEventForFusion) && provisional.fusion_verdict === "MATCH") {
+  finalised = await tryFinalisePass({
+    passId: pass.id,
+    latestAnpr: anpr,
+    latestAi: ai,
+    latestScan: scan,
+    registryVehicle,
+    scanEventForFusion,
+    provisional: {
+      fusion_verdict: "MATCH",
+      visual_confidence: provisional.visual_confidence || "NONE",
+      reasons: Array.isArray(provisional.reasons) ? provisional.reasons : []
+    }
+  });
+}
 
     // 11) Mark job complete
     await query(
@@ -582,7 +617,15 @@ async function tryFinalisePass({
 
   let finalFusion = null;
 
-  if (hasValidMatch && passAge !== null && passAge >= MATCH_STABILISE_SEC) {
+  const canEarlyMatch =
+  hasValidMatch &&
+  scanEventForFusion &&
+  isStrongMatch(scanEventForFusion);
+
+if (
+  (canEarlyMatch && passAge !== null && passAge >= 1) ||
+  (hasValidMatch && passAge !== null && passAge >= MATCH_STABILISE_SEC)
+) {
     finalFusion = decideFusion({
       registryVehicle,
       scanEvent: scanEventForFusion,
