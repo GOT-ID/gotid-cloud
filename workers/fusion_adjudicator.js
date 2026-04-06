@@ -9,7 +9,7 @@ const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same p
 const PASS_IDLE_FINALISE_SEC = 30;     // if no new ANPR for this long, pass can finalise
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
-const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
+const MISSING_OBSERVATION_SEC = 5;     // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
 
@@ -68,6 +68,7 @@ function isStrongSuspicion(v) {
     "TAMPER"
   ].includes(v);
 }
+
 function isStrongMatch(scanEvent) {
   if (!scanEvent) return false;
 
@@ -89,8 +90,8 @@ function isStrongMatch(scanEvent) {
     scanEvent.cloud_verdict !== "TAMPERED"
   );
 }
+
 function bestOf(existing, incoming) {
-  // Higher number = stronger final truth priority
   const rank = {
     MISMATCH_PUBKEY: 100,
     MISMATCH: 95,
@@ -233,7 +234,6 @@ async function processJobs() {
       await processSingleJob(job);
     }
 
-    // Also finalise old open passes even if no new jobs arrive
     await finaliseMatureOpenPasses();
   } catch (err) {
     console.error("❌ Worker loop error:", err);
@@ -246,7 +246,6 @@ async function processSingleJob(job) {
   try {
     console.log(`🔍 Processing ANPR job ${anpr_id}`);
 
-    // 1) Load ANPR event
     const anprRes = await query(
       `SELECT * FROM anpr_events WHERE id = $1 LIMIT 1`,
       [anpr_id]
@@ -260,7 +259,6 @@ async function processSingleJob(job) {
     const anpr = anprRes.rows[0];
     const plate = normPlate(anpr.plate);
 
-    // 2) Load earliest matching scan within ANPR window
     const scanRes = await query(
       `
       SELECT *
@@ -276,7 +274,6 @@ async function processSingleJob(job) {
 
     const scan = scanRes.rows[0] || null;
 
-    // 3) Load nearest AI event around the ANPR timestamp
     const aiRes = await query(
       `
       SELECT *
@@ -298,7 +295,6 @@ async function processSingleJob(job) {
 
     const ai = aiRes.rows[0] || null;
 
-    // 4) Load registry vehicle (pubkey first if scan exists, else plate)
     let registryVehicle = null;
     let observedPubkeyHex = "";
 
@@ -327,7 +323,6 @@ async function processSingleJob(job) {
       registryVehicle = regRes.rows[0] || null;
     }
 
-    // 5) Previous counter lookup
     let lastCounter = null;
 
     if (scan) {
@@ -376,10 +371,8 @@ async function processSingleJob(job) {
       }
     }
 
-    // 6) Build scan event for fusion brain
     const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
-    // 7) Open a pass (never reopen a finalised pass)
     const pass = await getOrCreateOpenPass({
       plate,
       anpr,
@@ -388,18 +381,15 @@ async function processSingleJob(job) {
       registryVehicle
     });
 
-    // 8) Provisional fusion for this evidence snapshot
     const provisional = decideFusion({
       registryVehicle,
       scanEvent: scanEventForFusion,
       anprEvent: anpr,
       aiEvent: ai,
       lastCounter,
-      // MISSING must not finalise immediately; only after pass matures
       allowMissingDecision: false
     });
 
-    // 9) Update pass with the new evidence
     await updatePassWithEvidence({
       pass,
       anpr,
@@ -408,27 +398,25 @@ async function processSingleJob(job) {
       registryVehicle,
       provisional
     });
-// 10) Allow early finalisation only for a strong cryptographic MATCH.
-// All other paths still wait for the background maturity sweep.
-let finalised = null;
 
-if (isStrongMatch(scanEventForFusion) && provisional.fusion_verdict === "MATCH") {
-  finalised = await tryFinalisePass({
-    passId: pass.id,
-    latestAnpr: anpr,
-    latestAi: ai,
-    latestScan: scan,
-    registryVehicle,
-    scanEventForFusion,
-    provisional: {
-      fusion_verdict: "MATCH",
-      visual_confidence: provisional.visual_confidence || "NONE",
-      reasons: Array.isArray(provisional.reasons) ? provisional.reasons : []
+    let finalised = null;
+
+    if (isStrongMatch(scanEventForFusion) && provisional.fusion_verdict === "MATCH") {
+      finalised = await tryFinalisePass({
+        passId: pass.id,
+        latestAnpr: anpr,
+        latestAi: ai,
+        latestScan: scan,
+        registryVehicle,
+        scanEventForFusion,
+        provisional: {
+          fusion_verdict: "MATCH",
+          visual_confidence: provisional.visual_confidence || "NONE",
+          reasons: Array.isArray(provisional.reasons) ? provisional.reasons : []
+        }
+      });
     }
-  });
-}
 
-    // 11) Mark job complete
     await query(
       `UPDATE fusion_jobs SET status='DONE', processed_at=NOW() WHERE id=$1`,
       [id]
@@ -446,7 +434,6 @@ if (isStrongMatch(scanEventForFusion) && provisional.fusion_verdict === "MATCH")
 }
 
 async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
-  // 1) Prefer an existing OPEN pass for the same plate close to this ANPR timestamp
   const openRes = await query(
     `
     SELECT *
@@ -464,7 +451,6 @@ async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
     return openRes.rows[0];
   }
 
-  // 2) Otherwise create a brand new pass
   const insertRes = await query(
     `
     INSERT INTO fusion_passes (
@@ -513,7 +499,6 @@ async function updatePassWithEvidence({ pass, anpr, ai, scan, registryVehicle, p
 
   const bestFusionVerdict = bestOf(p.final_fusion_verdict, provisional.fusion_verdict);
 
-  // Choose best scan/anpr/ai ids conservatively
   const bestScanEventId = scan?.id ?? p.best_scan_event_id;
   const bestAnprEventId = anpr?.id ?? p.best_anpr_event_id;
   const bestAiEventId = ai?.id ?? p.best_ai_event_id;
@@ -618,14 +603,14 @@ async function tryFinalisePass({
   let finalFusion = null;
 
   const canEarlyMatch =
-  hasValidMatch &&
-  scanEventForFusion &&
-  isStrongMatch(scanEventForFusion);
+    hasValidMatch &&
+    scanEventForFusion &&
+    isStrongMatch(scanEventForFusion);
 
-if (
-  (canEarlyMatch && passAge !== null && passAge >= 1) ||
-  (hasValidMatch && passAge !== null && passAge >= MATCH_STABILISE_SEC)
-) {
+  if (
+    (canEarlyMatch && passAge !== null && passAge >= 1) ||
+    (hasValidMatch && passAge !== null && passAge >= MATCH_STABILISE_SEC)
+  ) {
     finalFusion = decideFusion({
       registryVehicle,
       scanEvent: scanEventForFusion,
@@ -682,7 +667,6 @@ if (
 
   if (!finalFusion) return null;
 
-  // Normalise final labels for strong suspicion classes
   if (
     finalFusion.fusion_verdict === "COUNTER_ROLLBACK" ||
     finalFusion.fusion_verdict === "REPLAY_SUSPECT"
@@ -708,38 +692,56 @@ if (
     finalFusion.final_label = "UNREGISTERED_IDENTITY";
   }
 
-  await query(
+  // Police-grade alert suppression:
+  // same plate + same final label within 30s = same continuing incident
+  const recentRes = await query(
     `
-    INSERT INTO fusion_events (
-      plate,
-      scan_event_id,
-      anpr_id,
-      ai_id,
-      fusion_verdict,
-      final_label,
-      visual_confidence,
-      has_gotid,
-      registry_status,
-      reasons,
-      raw_json,
-      created_at
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+    SELECT 1
+    FROM fusion_events
+    WHERE plate = $1
+      AND final_label = $2
+      AND created_at > NOW() - INTERVAL '30 seconds'
+    LIMIT 1
     `,
-    [
-      pass.plate,
-      pass.best_scan_event_id ?? null,
-      pass.best_anpr_event_id ?? null,
-      pass.best_ai_event_id ?? null,
-      finalFusion.fusion_verdict,
-      finalFusion.final_label,
-      finalFusion.visual_confidence || pass.visual_confidence || "NONE",
-      pass.has_gotid_expected,
-      pass.registry_status,
-      finalFusion.reasons || pass.reasons || [],
-      finalFusion
-    ]
+    [pass.plate, finalFusion.final_label]
   );
+
+  if (recentRes.rows.length) {
+    console.log(`🔕 Suppressed duplicate alert for ${pass.plate} (${finalFusion.final_label})`);
+  } else {
+    await query(
+      `
+      INSERT INTO fusion_events (
+        plate,
+        scan_event_id,
+        anpr_id,
+        ai_id,
+        fusion_verdict,
+        final_label,
+        visual_confidence,
+        has_gotid,
+        registry_status,
+        reasons,
+        raw_json,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      `,
+      [
+        pass.plate,
+        pass.best_scan_event_id ?? null,
+        pass.best_anpr_event_id ?? null,
+        pass.best_ai_event_id ?? null,
+        finalFusion.fusion_verdict,
+        finalFusion.final_label,
+        finalFusion.visual_confidence || pass.visual_confidence || "NONE",
+        pass.has_gotid_expected,
+        pass.registry_status,
+        finalFusion.reasons || pass.reasons || [],
+        finalFusion
+      ]
+    );
+  }
 
   await query(
     `
@@ -836,6 +838,5 @@ async function failJob(id, error) {
   );
 }
 
-// Run once immediately, then repeat
 processJobs();
 setInterval(processJobs, LOOP_INTERVAL_MS);
