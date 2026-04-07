@@ -9,7 +9,7 @@ import scansRoute from "./routes/v1/scans.js";
 import authRoute from "./routes/v1/auth.js";
 import anprRoute from "./routes/v1/anpr.js";
 import aiRoute from "./routes/v1/ai.js";
-import fusionRoute from "./routes/v1/fusion.js"; // ✅ ADD THIS
+import fusionRoute from "./routes/v1/fusion.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
@@ -17,12 +17,24 @@ const __dirname = path.resolve(path.dirname(__filename));
 const app = express();
 app.set("trust proxy", 1);
 
-// ---- basic CORS (safe for prototype; tighten later) ----
+// ----------------------------------------------
+// CORS
+// ----------------------------------------------
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin || "*";
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Cache-Control, Pragma, Expires, X-Requested-With, Accept, Origin"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
   next();
 });
 
@@ -47,9 +59,9 @@ app.get("/", (req, res) => {
       auth_status: "/v1/auth/status",
       anpr: "/v1/anpr",
       ai: "/v1/ai",
-      fusion: "/v1/fusion",                 // ✅ ADD THIS
-      fusion_recent: "/v1/fusion/recent"    // ✅ ADD THIS
-    }
+      fusion: "/v1/fusion",
+      fusion_recent: "/v1/fusion/recent",
+    },
   });
 });
 
@@ -61,7 +73,7 @@ app.use("/v1/scans", scansRoute);
 app.use("/v1/auth", authRoute);
 app.use("/v1/anpr", anprRoute);
 app.use("/v1/ai", aiRoute);
-app.use("/v1/fusion", fusionRoute); // ✅ ADD THIS
+app.use("/v1/fusion", fusionRoute);
 
 // ----------------------------------------------
 // 404 FALLBACK
