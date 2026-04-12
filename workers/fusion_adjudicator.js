@@ -2,11 +2,11 @@ import { query } from "../db/index.js";
 import { decideFusion } from "../fusion.js";
 
 const SIGN_WINDOW_SEC = 20;
-const LOOP_INTERVAL_MS = 2000;
+const LOOP_INTERVAL_MS = 1000;
 
 // Pass/session timing
 const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same pass
-const PASS_IDLE_FINALISE_SEC = 30;     // if no new ANPR for this long, pass can finalise
+const PASS_IDLE_FINALISE_SEC = 8;     // if no new ANPR for this long, pass can finalise
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
 const MISSING_OBSERVATION_SEC = 5;     // must wait this long before UUID_MISSING finalises
