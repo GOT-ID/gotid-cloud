@@ -6,7 +6,7 @@ const LOOP_INTERVAL_MS = 1000;
 
 // Pass/session timing
 const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same pass
-const PASS_IDLE_FINALISE_SEC = 8;      // if no new ANPR for this long, pass can finalise
+const PASS_IDLE_FINALISE_SEC = 8;     // if no new ANPR for this long, pass can finalise
 const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
 const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
 const MISSING_OBSERVATION_SEC = 5;     // must wait this long before UUID_MISSING finalises
@@ -67,18 +67,6 @@ function isStrongSuspicion(v) {
     "COUNTER_ROLLBACK",
     "TAMPER"
   ].includes(v);
-}
-
-function passHasEstablishedMatch(pass) {
-  if (!pass) return false;
-
-  return (
-    pass.strongest_crypto_state === "MATCH" ||
-    pass.final_fusion_verdict === "MATCH" ||
-    pass.final_label === "MATCH_STRONG" ||
-    pass.final_label === "MATCH_WEAK_VISUAL" ||
-    pass.final_label === "MATCH_CRYPTO_ONLY"
-  );
 }
 
 function isStrongMatch(scanEvent) {
@@ -276,9 +264,10 @@ async function processSingleJob(job) {
       SELECT *
       FROM scan_events
       WHERE plate = $1
-        AND created_at BETWEEN $2::timestamptz
+        AND created_at BETWEEN ($2::timestamptz - ($3 * INTERVAL '1 second'))
                           AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
-      ORDER BY created_at ASC
+      ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $2::timestamptz))) ASC,
+               created_at ASC
       LIMIT 1
       `,
       [plate, anpr.ts, SIGN_WINDOW_SEC]
@@ -606,17 +595,9 @@ async function tryFinalisePass({
   const idleAge = ageSec(pass.last_seen_at, now);
 
   const strongest = pass.final_fusion_verdict || provisional.fusion_verdict || "PENDING";
-  const establishedMatch = passHasEstablishedMatch(pass);
-  const hasValidMatch = strongest === "MATCH" || establishedMatch;
+  const hasValidMatch = strongest === "MATCH";
   const hasStrongSuspicion = isStrongSuspicion(strongest);
-
-  // Scanner-first, pass-based rule:
-  // once this OPEN pass has already established a valid MATCH,
-  // do not let later repeated ANPR observations downgrade it to
-  // UUID_MISSING simply because there was no brand-new scan event
-  // emitted for that exact observation.
   const isMissingCandidate =
-    !establishedMatch &&
     (strongest === "PENDING" || strongest === "UUID_MISSING" || !strongest) &&
     pass.has_gotid_expected === true;
 
@@ -639,24 +620,6 @@ async function tryFinalisePass({
       lastCounter: null,
       allowMissingDecision: false
     });
-
-    // If this pass was already MATCH-established, never let it
-    // fall back to UUID_MISSING within the same open pass unless
-    // stronger contrary evidence has actually appeared.
-    if (!finalFusion || !finalFusion.fusion_verdict || finalFusion.fusion_verdict === "UUID_MISSING") {
-      finalFusion = {
-        fusion_verdict: "MATCH",
-        final_label:
-          pass.visual_confidence === "STRONG"
-            ? "MATCH_STRONG"
-            : "MATCH_WEAK_VISUAL",
-        visual_confidence: pass.visual_confidence || "NONE",
-        reasons: Array.isArray(pass.reasons) ? pass.reasons : [],
-        plate: pass.plate,
-        has_gotid: pass.has_gotid_expected,
-        registry_status: pass.registry_status
-      };
-    }
   } else if (
     hasStrongSuspicion &&
     passAge !== null &&
