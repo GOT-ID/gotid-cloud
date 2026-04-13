@@ -74,7 +74,7 @@ router.post("/", requireAuth, async (req, res) => {
     // 0) Registry lookup for debug/audit context only
     const regRes = await query(
       `
-      SELECT plate, status, gotid_uuid, public_key, raw_json, make, model, colour, vin
+      SELECT plate, status, gotid_uuid, public_key, raw_json, make, model, colour, vin, has_gotid
       FROM vehicles
       WHERE plate = $1
       LIMIT 1;
@@ -84,11 +84,8 @@ router.post("/", requireAuth, async (req, res) => {
 
     const reg = regRes.rows[0] || null;
 
-    const hasGotId =
-      !!(reg && reg.public_key && String(reg.public_key).trim().length > 0) ||
-      !!(reg && reg.gotid_uuid && String(reg.gotid_uuid).trim().length > 0) ||
-      !!(reg && reg.raw_json && reg.raw_json.has_gotid === true);
-
+    // Single source of truth: vehicles.has_gotid
+    const hasGotId = reg?.has_gotid === true;
     const registryStatus = reg?.status || "UNKNOWN";
 
     // 1) Insert ANPR event
@@ -151,7 +148,7 @@ router.post("/", requireAuth, async (req, res) => {
       anpr_id: row.id,
       ts: row.ts,
       enrolled: !!reg,
-      has_gotid: hasGotId === true,
+      has_gotid: hasGotId,
       registry_status: registryStatus,
       ai_linked: !!aiEvent,
       ai_id: aiEvent?.id ?? null,
