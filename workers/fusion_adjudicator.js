@@ -712,21 +712,21 @@ async function tryFinalisePass({
   } else {
     await query(
       `
-      INSERT INTO fusion_events (
-        plate,
-        scan_event_id,
-        anpr_id,
-        ai_id,
-        fusion_verdict,
-        final_label,
-        visual_confidence,
-        has_gotid,
-        registry_status,
-        reasons,
-        raw_json,
-        created_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+     INSERT INTO fusion_events (
+  plate,
+  scan_event_id,
+  anpr_event_id,
+  ai_event_id,
+  fusion_verdict,
+  final_label,
+  visual_confidence,
+  has_gotid,
+  registry_status,
+  reasons,
+  raw_json,
+  created_at
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
       `,
       [
         pass.plate,
