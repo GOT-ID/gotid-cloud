@@ -1,15 +1,15 @@
 import { query } from "../db/index.js";
 import { decideFusion } from "../fusion.js";
 
-const SIGN_WINDOW_SEC = 20;
+const SIGN_WINDOW_SEC = 10;
 const LOOP_INTERVAL_MS = 1000;
 
 // Pass/session timing
-const PASS_OPEN_WINDOW_SEC = 45;       // same plate within this window = same pass
+const PASS_OPEN_WINDOW_SEC = 45;      // same plate within this window = same pass
 const PASS_IDLE_FINALISE_SEC = 8;     // if no new ANPR for this long, pass can finalise
-const MATCH_STABILISE_SEC = 5;         // valid match can finalise early after stabilising
-const SUSPICION_STABILISE_SEC = 8;     // replay/relay/invalid/tamper stabilisation
-const MISSING_OBSERVATION_SEC = 5;     // must wait this long before UUID_MISSING finalises
+const MATCH_STABILISE_SEC = 5;        // valid match can finalise early after stabilising
+const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisation
+const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
 
@@ -178,8 +178,8 @@ function buildCloudVerdict({
   } else if (scanner_result === "TAMPERED") {
     return "TAMPERED";
   } else if (scanner_result === "MATCH") {
-  return "MATCH";
-}
+    return "MATCH";
+  }
 
   return null;
 }
@@ -260,18 +260,18 @@ async function processSingleJob(job) {
     const plate = normPlate(anpr.plate);
 
     const scanRes = await query(
-  `
-  SELECT *
-  FROM scan_events
-  WHERE plate = $1
-    AND created_at BETWEEN ($2::timestamptz - ($3 * INTERVAL '1 second'))
-                      AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
-  ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $2::timestamptz))) ASC,
-           created_at ASC
-  LIMIT 1
-  `,
-  [plate, anpr.ts, SIGN_WINDOW_SEC]
-);
+      `
+      SELECT *
+      FROM scan_events
+      WHERE plate = $1
+        AND created_at BETWEEN ($2::timestamptz - ($3 * INTERVAL '1 second'))
+                          AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
+      ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $2::timestamptz))) ASC,
+               created_at ASC
+      LIMIT 1
+      `,
+      [plate, anpr.ts, SIGN_WINDOW_SEC]
+    );
 
     const scan = scanRes.rows[0] || null;
 
@@ -478,7 +478,7 @@ async function getOrCreateOpenPass({ plate, anpr, ai, scan, registryVehicle }) {
       anpr.camera_id || anpr.source_id || null,
       anpr.lane_id || null,
       registryVehicle?.id ?? null,
-      registryVehicle ? (registryVehicle.has_gotid === true) : false,
+      registryVehicle?.has_gotid === true,
       registryVehicle?.status || "unknown",
       anpr.ts,
       anpr.ts,
