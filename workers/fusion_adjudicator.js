@@ -468,28 +468,28 @@ async function enrichSingleEvidenceWindow(ew) {
       `
       UPDATE evidence_windows
       SET
-        first_return_scan_id = $2,
+        first_return_scan_id = $2::bigint,
         first_return_scan_ts = $3::timestamptz,
-        strongest_rssi = COALESCE(strongest_rssi, $4),
-        nearest_est_distance_m = COALESCE(nearest_est_distance_m, $5),
-        scanner_id = COALESCE(scanner_id, $6),
+        strongest_rssi = COALESCE(strongest_rssi, $4::integer),
+        nearest_est_distance_m = COALESCE(nearest_est_distance_m, $5::numeric),
+        scanner_id = COALESCE(scanner_id, $6::text),
         raw_json = jsonb_set(
           jsonb_set(
             COALESCE(raw_json, '{}'::jsonb),
             '{transition}',
             COALESCE(raw_json->'transition', '{}'::jsonb) || jsonb_build_object(
-              'first_return_scan_id', $2,
-              'first_return_scan_ts', $3
+              'first_return_scan_id', $2::bigint,
+              'first_return_scan_ts', $3::timestamptz
             ),
             true
           ),
           '{scanner_health}',
           COALESCE(raw_json->'scanner_health', '{}'::jsonb) || jsonb_build_object(
-            'scanner_id', COALESCE(scanner_id, $6)
+            'scanner_id', COALESCE(scanner_id, $6::text)
           ),
           true
         )
-      WHERE id = $1
+      WHERE id = $1::bigint
         AND first_return_scan_id IS NULL
       `,
       [
