@@ -12,6 +12,7 @@ const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisati
 const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
+console.log("🚨 WORKER VERSION: evidence enrichment debug build loaded");
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -404,6 +405,8 @@ async function createEvidenceWindow({
 
 async function enrichOpenEvidenceWindows() {
   try {
+    console.log("🧪 enrichment loop running");
+
     const pendingRes = await query(
       `
       SELECT *
@@ -415,6 +418,8 @@ async function enrichOpenEvidenceWindows() {
       `
     );
 
+    console.log(`🧪 evidence windows awaiting enrichment: ${pendingRes.rows.length}`);
+
     for (const ew of pendingRes.rows) {
       await enrichSingleEvidenceWindow(ew);
     }
@@ -425,10 +430,15 @@ async function enrichOpenEvidenceWindows() {
 
 async function enrichSingleEvidenceWindow(ew) {
   try {
+    console.log(`🧪 checking evidence window ${ew.id}`);
+
     const plate = normPlate(ew?.plate);
     const anchorTs = ew?.window_end || ew?.created_at || null;
 
-    if (!plate || !anchorTs) return;
+    if (!plate || !anchorTs) {
+      console.log(`⏭️ skipping evidence window ${ew?.id} (missing plate or anchorTs)`);
+      return;
+    }
 
     const returnRes = await query(
       `
@@ -446,7 +456,13 @@ async function enrichSingleEvidenceWindow(ew) {
     );
 
     const firstReturn = returnRes.rows[0] || null;
-    if (!firstReturn) return;
+
+    if (!firstReturn) {
+      console.log(`⏭️ no return scan found yet for evidence window ${ew.id}`);
+      return;
+    }
+
+    console.log(`🧪 found return scan ${firstReturn.id} for evidence window ${ew.id}`);
 
     await query(
       `
