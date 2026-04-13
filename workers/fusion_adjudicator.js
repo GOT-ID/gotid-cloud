@@ -235,7 +235,7 @@ function shouldCreateEvidenceWindow(decisionType) {
 
 async function resolveEvidenceAnchors({ pass, latestAnpr }) {
   const plate = normPlate(pass?.plate);
-  const anchorTs = latestAnpr?.ts || pass?.best_anpr_event_id || pass?.last_seen_at || null;
+  const anchorTs = latestAnpr?.ts || pass?.last_seen_at || pass?.first_seen_at || null;
 
   if (!plate || !anchorTs) {
     return {
