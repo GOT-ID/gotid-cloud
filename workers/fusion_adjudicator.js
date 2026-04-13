@@ -178,8 +178,8 @@ function buildCloudVerdict({
   } else if (scanner_result === "TAMPERED") {
     return "TAMPERED";
   } else if (scanner_result === "MATCH") {
-    return "AUTHENTIC";
-  }
+  return "MATCH";
+}
 
   return null;
 }
