@@ -456,6 +456,40 @@ async function enrichSingleEvidenceWindow(ew) {
     );
 
     const firstReturn = returnRes.rows[0] || null;
+    // --- compute gap + classification ---
+let gapSeconds = null;
+let returnClassification = null;
+let decisionConfidence = "MEDIUM";
+
+if (ew.last_valid_scan_ts && firstReturn.created_at) {
+  const last = new Date(ew.last_valid_scan_ts).getTime();
+  const ret = new Date(firstReturn.created_at).getTime();
+
+  if (Number.isFinite(last) && Number.isFinite(ret)) {
+    gapSeconds = (ret - last) / 1000;
+
+    if (gapSeconds < 10) {
+      returnClassification = "NORMAL_RETURN";
+    } else if (gapSeconds < 30) {
+      returnClassification = "DELAYED_RETURN";
+    } else {
+      returnClassification = "SUSPICIOUS_RETURN";
+    }
+  }
+}
+
+// decision confidence
+if (
+  ew.decision_type === "RELAY_SUSPECT" ||
+  ew.decision_type === "REPLAY_SUSPECT" ||
+  ew.decision_type === "INVALID_TAG"
+) {
+  decisionConfidence = "HIGH";
+} else if (ew.decision_type === "UUID_MISSING") {
+  decisionConfidence = "MEDIUM";
+} else {
+  decisionConfidence = "LOW";
+}
 
     if (!firstReturn) {
       console.log(`⏭️ no return scan found yet for evidence window ${ew.id}`);
@@ -473,6 +507,9 @@ async function enrichSingleEvidenceWindow(ew) {
         strongest_rssi = COALESCE(strongest_rssi, $4::integer),
         nearest_est_distance_m = COALESCE(nearest_est_distance_m, $5::numeric),
         scanner_id = COALESCE(scanner_id, $6::text),
+        gap_seconds = COALESCE(gap_seconds, $7),
+return_classification = COALESCE(return_classification, $8),
+decision_confidence = COALESCE(decision_confidence, $9),
         raw_json = jsonb_set(
           jsonb_set(
             COALESCE(raw_json, '{}'::jsonb),
@@ -493,13 +530,16 @@ async function enrichSingleEvidenceWindow(ew) {
         AND first_return_scan_id IS NULL
       `,
       [
-        ew.id,
-        firstReturn.id,
-        firstReturn.created_at,
-        firstReturn.rssi ?? null,
-        firstReturn.est_distance_m ?? null,
-        firstReturn.scanner_id || "SCN-001"
-      ]
+  ew.id,
+  firstReturn.id,
+  firstReturn.created_at,
+  firstReturn.rssi ?? null,
+  firstReturn.est_distance_m ?? null,
+  firstReturn.scanner_id || "SCN-001",
+  gapSeconds,
+  returnClassification,
+  decisionConfidence
+]
     );
 
     console.log(`🧾 Evidence window ${ew.id} enriched with return scan ${firstReturn.id}`);
