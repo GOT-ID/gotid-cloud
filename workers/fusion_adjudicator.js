@@ -260,18 +260,18 @@ async function processSingleJob(job) {
     const plate = normPlate(anpr.plate);
 
     const scanRes = await query(
-      `
-      SELECT *
-      FROM scan_events
-      WHERE plate = $1
-        AND created_at BETWEEN ($2::timestamptz - ($3 * INTERVAL '1 second'))
-                          AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
-      ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $2::timestamptz))) ASC,
-               created_at ASC
-      LIMIT 1
-      `,
-      [plate, anpr.ts, SIGN_WINDOW_SEC]
-    );
+  `
+  SELECT *
+  FROM scan_events
+  WHERE plate = $1
+    AND created_at BETWEEN ($2::timestamptz - ($3 * INTERVAL '1 second'))
+                      AND ($2::timestamptz + ($3 * INTERVAL '1 second'))
+  ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $2::timestamptz))) ASC,
+           created_at ASC
+  LIMIT 1
+  `,
+  [plate, anpr.ts, SIGN_WINDOW_SEC]
+);
 
     const scan = scanRes.rows[0] || null;
 
