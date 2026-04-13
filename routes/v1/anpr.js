@@ -6,7 +6,7 @@ import { query } from "../../db/index.js";
 const router = Router();
 
 // Shared policy values
-const SIGN_WINDOW_SEC = 2;
+const SIGN_WINDOW_SEC = 10;
 const PASS_DEDUP_SEC = 12;
 const RECENT_MATCH_SUPPRESS_SEC = 25;
 
