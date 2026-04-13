@@ -215,7 +215,8 @@ function buildScanEventForFusion(scan, registryVehicle) {
     cloud_verdict,
     scanner_result,
     has_identity,
-    created_at: scan.created_at
+    created_at: scan.created_at,
+    scanner_id: scan.scanner_id || null
   };
 }
 
@@ -401,6 +402,96 @@ async function createEvidenceWindow({
   }
 }
 
+async function enrichOpenEvidenceWindows() {
+  try {
+    const pendingRes = await query(
+      `
+      SELECT *
+      FROM evidence_windows
+      WHERE decision_type IN ('UUID_MISSING', 'RELAY_SUSPECT')
+        AND first_return_scan_id IS NULL
+      ORDER BY created_at ASC
+      LIMIT 20
+      `
+    );
+
+    for (const ew of pendingRes.rows) {
+      await enrichSingleEvidenceWindow(ew);
+    }
+  } catch (err) {
+    console.error("❌ Evidence enrichment loop error:", err);
+  }
+}
+
+async function enrichSingleEvidenceWindow(ew) {
+  try {
+    const plate = normPlate(ew?.plate);
+    const anchorTs = ew?.window_end || ew?.created_at || null;
+
+    if (!plate || !anchorTs) return;
+
+    const returnRes = await query(
+      `
+      SELECT id, created_at, rssi, est_distance_m, scanner_id
+      FROM scan_events
+      WHERE plate = $1
+        AND sig_valid = true
+        AND chal_valid = true
+        AND COALESCE(tamper_flag, false) = false
+        AND created_at > $2::timestamptz
+      ORDER BY created_at ASC
+      LIMIT 1
+      `,
+      [plate, anchorTs]
+    );
+
+    const firstReturn = returnRes.rows[0] || null;
+    if (!firstReturn) return;
+
+    await query(
+      `
+      UPDATE evidence_windows
+      SET
+        first_return_scan_id = $2,
+        first_return_scan_ts = $3::timestamptz,
+        strongest_rssi = COALESCE(strongest_rssi, $4),
+        nearest_est_distance_m = COALESCE(nearest_est_distance_m, $5),
+        scanner_id = COALESCE(scanner_id, $6),
+        raw_json = jsonb_set(
+          jsonb_set(
+            COALESCE(raw_json, '{}'::jsonb),
+            '{transition}',
+            COALESCE(raw_json->'transition', '{}'::jsonb) || jsonb_build_object(
+              'first_return_scan_id', $2,
+              'first_return_scan_ts', $3
+            ),
+            true
+          ),
+          '{scanner_health}',
+          COALESCE(raw_json->'scanner_health', '{}'::jsonb) || jsonb_build_object(
+            'scanner_id', COALESCE(scanner_id, $6)
+          ),
+          true
+        )
+      WHERE id = $1
+        AND first_return_scan_id IS NULL
+      `,
+      [
+        ew.id,
+        firstReturn.id,
+        firstReturn.created_at,
+        firstReturn.rssi ?? null,
+        firstReturn.est_distance_m ?? null,
+        firstReturn.scanner_id || "SCN-001"
+      ]
+    );
+
+    console.log(`🧾 Evidence window ${ew.id} enriched with return scan ${firstReturn.id}`);
+  } catch (err) {
+    console.error(`❌ Failed to enrich evidence window ${ew?.id}:`, err);
+  }
+}
+
 async function processJobs() {
   try {
     const jobs = await query(`
@@ -416,6 +507,7 @@ async function processJobs() {
       await processSingleJob(job);
     }
 
+    await enrichOpenEvidenceWindows();
     await finaliseMatureOpenPasses();
   } catch (err) {
     console.error("❌ Worker loop error:", err);
