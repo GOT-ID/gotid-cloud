@@ -5,14 +5,14 @@ const SIGN_WINDOW_SEC = 10;
 const LOOP_INTERVAL_MS = 1000;
 
 // Pass/session timing
-const PASS_OPEN_WINDOW_SEC = 45;      // same plate within this window = same pass
-const PASS_IDLE_FINALISE_SEC = 8;     // if no new ANPR for this long, pass can finalise
-const MATCH_STABILISE_SEC = 5;        // valid match can finalise early after stabilising
-const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisation
-const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
+const PASS_OPEN_WINDOW_SEC = 45;
+const PASS_IDLE_FINALISE_SEC = 8;
+const MATCH_STABILISE_SEC = 5;
+const SUSPICION_STABILISE_SEC = 8;
+const MISSING_OBSERVATION_SEC = 5;
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
-console.log("🚨 WORKER VERSION: scenario-aware honest-missing build loaded");
+console.log("🚨 WORKER VERSION: encounter-classifier + evidence-policy build loaded");
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -103,6 +103,7 @@ function bestOf(existing, incoming) {
     TAMPER: 75,
     MATCH: 60,
     UUID_MISSING: 30,
+    NO_SCANNER_EVIDENCE: 25,
     NOT_ENROLLED: 20,
     UNKNOWN_TAG: 18,
     PENDING: 5,
@@ -178,7 +179,7 @@ function buildCloudVerdict({
     return "RELAY_SUSPECT";
   } else if (scanner_result === "TAMPERED") {
     return "TAMPERED";
-  } else if (scanner_result === "MATCH") {
+  } else if (scanner_result === "MATCH" || scanner_result === "AUTHENTIC") {
     return "MATCH";
   }
 
@@ -226,10 +227,12 @@ function extractTrackAgeSeconds(ev) {
     ev?.raw_json?.raw_json?.track_age_s,
     ev?.raw_json?.track_age_s
   ];
+
   for (const c of candidates) {
     const n = Number(c);
     if (Number.isFinite(n)) return n;
   }
+
   return null;
 }
 
@@ -238,39 +241,13 @@ function extractFramesSeen(ev) {
     ev?.raw_json?.raw_json?.frames_seen,
     ev?.raw_json?.frames_seen
   ];
+
   for (const c of candidates) {
     const n = Number(c);
     if (Number.isFinite(n)) return n;
   }
+
   return null;
-}
-
-function chooseFusionMode({ anprEvent, aiEvent }) {
-  const anprTrackAge = extractTrackAgeSeconds(anprEvent);
-  const aiTrackAge = extractTrackAgeSeconds(aiEvent);
-  const anprFrames = extractFramesSeen(anprEvent);
-  const aiFrames = extractFramesSeen(aiEvent);
-
-  const maxTrackAge = Math.max(
-    Number.isFinite(anprTrackAge) ? anprTrackAge : -1,
-    Number.isFinite(aiTrackAge) ? aiTrackAge : -1
-  );
-
-  const maxFrames = Math.max(
-    Number.isFinite(anprFrames) ? anprFrames : -1,
-    Number.isFinite(aiFrames) ? aiFrames : -1
-  );
-
-  // PASS_BY = brief sighting / drive-by
-  // OBSERVATION = longer tracked presence where multi-window absence is fair
-  if (
-    (Number.isFinite(maxTrackAge) && maxTrackAge >= 10) ||
-    (Number.isFinite(maxFrames) && maxFrames >= 10)
-  ) {
-    return "OBSERVATION";
-  }
-
-  return "PASS_BY";
 }
 
 function scannerResultFromWindow(row) {
@@ -278,121 +255,206 @@ function scannerResultFromWindow(row) {
   return typeof s === "string" ? s.toUpperCase().trim() : "";
 }
 
-function isCleanMissingWindow(row) {
-  const validUuidSeen = row.valid_uuid_seen === true;
-  const validSigSeen = row.valid_sig_seen === true;
-  const validChalSeen = row.valid_chal_seen === true;
-  const pkMatchSeen = row.pk_match_seen === true;
+function hasScannerCoverage(row) {
+  if (!row) return false;
+
+  return (
+    Number(row.ble_packets_seen || 0) > 0 ||
+    Number(row.ble_devices_seen || 0) > 0 ||
+    Number(row.companyid_hits_seen || 0) > 0 ||
+    Number(row.gotid_candidates_seen || 0) > 0 ||
+    row.strongest_rssi !== null
+  );
+}
+
+function windowShowsIdentity(row) {
+  if (!row) return false;
+
+  return (
+    row.valid_uuid_seen === true ||
+    row.valid_sig_seen === true ||
+    row.valid_chal_seen === true ||
+    row.pk_match_seen === true
+  );
+}
+
+function windowShowsRelay(row) {
+  if (!row) return false;
+
   const scannerResult = scannerResultFromWindow(row);
 
-  const blePacketsSeen = Number(row.ble_packets_seen || 0);
-  const bleDevicesSeen = Number(row.ble_devices_seen || 0);
-  const companyIdHits = Number(row.companyid_hits_seen || 0);
-  const gotidCandidates = Number(row.gotid_candidates_seen || 0);
-  const strongestRssi = row.strongest_rssi;
+  return (
+    scannerResult === "RELAY_SUSPECT" ||
+    (
+      row.valid_uuid_seen === true &&
+      row.valid_sig_seen === true &&
+      row.valid_chal_seen === false
+    )
+  );
+}
 
-  const scannerAlive =
-    blePacketsSeen > 0 ||
-    bleDevicesSeen > 0 ||
-    companyIdHits > 0 ||
-    gotidCandidates > 0 ||
-    strongestRssi !== null;
-
-  if (!scannerAlive) return false;
-
-  if (validUuidSeen || validSigSeen || validChalSeen || pkMatchSeen) return false;
-
-  if (scannerResult === "RELAY_SUSPECT") return false;
-  if (scannerResult === "AUTHENTIC") return false;
-  if (scannerResult === "MATCH") return false;
-
+function isCleanAbsenceWindow(row) {
+  if (!row) return false;
+  if (!hasScannerCoverage(row)) return false;
+  if (windowShowsIdentity(row)) return false;
+  if (windowShowsRelay(row)) return false;
   return true;
 }
 
-function isContaminatedMissingWindow(row) {
-  if (!row) return false;
-
-  const validUuidSeen = row.valid_uuid_seen === true;
-  const validSigSeen = row.valid_sig_seen === true;
-  const validChalSeen = row.valid_chal_seen === true;
-  const pkMatchSeen = row.pk_match_seen === true;
-  const scannerResult = scannerResultFromWindow(row);
-
-  if (validUuidSeen || validSigSeen || validChalSeen || pkMatchSeen) return true;
-  if (scannerResult === "RELAY_SUSPECT") return true;
-  if (scannerResult === "AUTHENTIC") return true;
-  if (scannerResult === "MATCH") return true;
-
-  return false;
-}
-
-async function findScannerWindowEvidence({ plate, anchorTs, fusionMode = "PASS_BY" }) {
+async function getEncounterWindows({ plate, anchorTs }) {
   const p = normPlate(plate);
-  if (!p || !anchorTs) return null;
+  if (!p || !anchorTs) return [];
 
-  const latestRes = await query(
+  const res = await query(
     `
     SELECT *
     FROM scanner_window_events
     WHERE plate = $1
-      AND window_start <= ($2::timestamptz + INTERVAL '10 seconds')
-      AND window_end   >= ($2::timestamptz - INTERVAL '10 seconds')
-    ORDER BY
-      ABS(EXTRACT(EPOCH FROM (
-        $2::timestamptz - (window_start + ((window_end - window_start) / 2))
-      ))) ASC,
-      created_at DESC
-    LIMIT 1
+      AND created_at BETWEEN ($2::timestamptz - INTERVAL '20 seconds')
+                         AND ($2::timestamptz + INTERVAL '20 seconds')
+    ORDER BY created_at ASC
     `,
     [p, anchorTs]
   );
 
-  const latest = latestRes.rows[0] || null;
-  if (!latest) return null;
+  return res.rows;
+}
 
-  const windowsRes = await query(
+async function getEncounterScans({ plate, anchorTs }) {
+  const p = normPlate(plate);
+  if (!p || !anchorTs) return [];
+
+  const res = await query(
     `
     SELECT *
-    FROM scanner_window_events
+    FROM scan_events
     WHERE plate = $1
-      AND created_at <= $2::timestamptz
-      AND created_at >= ($2::timestamptz - INTERVAL '20 seconds')
-    ORDER BY created_at DESC
+      AND created_at BETWEEN ($2::timestamptz - INTERVAL '20 seconds')
+                         AND ($2::timestamptz + INTERVAL '20 seconds')
+    ORDER BY created_at ASC
     `,
-    [p, latest.created_at]
+    [p, anchorTs]
   );
 
-  let consecutiveMissingWindows = 0;
-  let contaminated = false;
+  return res.rows;
+}
 
-  if (fusionMode === "OBSERVATION") {
-    for (const row of windowsRes.rows) {
-      if (isCleanMissingWindow(row)) {
-        consecutiveMissingWindows += 1;
-      } else {
-        if (isContaminatedMissingWindow(row)) {
-          contaminated = true;
-        }
-        break;
+function classifyEncounterProfile({ anprEvent, aiEvent }) {
+  const trackAge = Math.max(
+    Number.isFinite(extractTrackAgeSeconds(anprEvent)) ? extractTrackAgeSeconds(anprEvent) : -1,
+    Number.isFinite(extractTrackAgeSeconds(aiEvent)) ? extractTrackAgeSeconds(aiEvent) : -1
+  );
+
+  const framesSeen = Math.max(
+    Number.isFinite(extractFramesSeen(anprEvent)) ? extractFramesSeen(anprEvent) : -1,
+    Number.isFinite(extractFramesSeen(aiEvent)) ? extractFramesSeen(aiEvent) : -1
+  );
+
+  if (
+    (Number.isFinite(trackAge) && trackAge >= 10) ||
+    (Number.isFinite(framesSeen) && framesSeen >= 10)
+  ) {
+    return "SUSTAINED";
+  }
+
+  return "BRIEF";
+}
+
+function buildFallbackWindowForFusion(row, consecutiveCleanAbsenceWindows = 0) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    plate: row.plate || null,
+    camera_id: row.camera_id || null,
+    scanner_id: row.scanner_id || null,
+    window_start: row.window_start || null,
+    window_end: row.window_end || null,
+    ble_packets_seen: Number(row.ble_packets_seen || 0),
+    ble_devices_seen: Number(row.ble_devices_seen || 0),
+    companyid_hits_seen: Number(row.companyid_hits_seen || 0),
+    gotid_candidates_seen: Number(row.gotid_candidates_seen || 0),
+    strongest_rssi: row.strongest_rssi ?? null,
+    nearest_est_distance_m: row.nearest_est_distance_m ?? null,
+    valid_uuid_seen: row.valid_uuid_seen === true,
+    valid_sig_seen: row.valid_sig_seen === true,
+    valid_chal_seen: row.valid_chal_seen === true,
+    pk_match_seen: row.pk_match_seen === true,
+    consecutive_missing_windows: consecutiveCleanAbsenceWindows
+  };
+}
+
+function summariseEncounter({
+  windows,
+  scans,
+  anprEvent,
+  aiEvent
+}) {
+  const encounterProfile = classifyEncounterProfile({ anprEvent, aiEvent });
+
+  const scannerCoveragePresent = windows.some(hasScannerCoverage);
+
+  const identitySeenInWindows = windows.some(windowShowsIdentity);
+  const relaySeenInWindows = windows.some(windowShowsRelay);
+
+  const identitySeenInScans = scans.some((s) => {
+    const sig = asBool(s.sig_valid, false);
+    const pub = normHex(s.raw_json?.pubkey_hex || "");
+    return sig === true && !!pub;
+  });
+
+  const validMatchSeenInScans = scans.some((s) => {
+    return asBool(s.sig_valid, false) === true && asBool(s.chal_valid, false) === true;
+  });
+
+  const relaySeenInScans = scans.some((s) => {
+    return asBool(s.sig_valid, false) === true && asBool(s.chal_valid, false) === false;
+  });
+
+  let consecutiveCleanAbsenceWindows = 0;
+  let contaminatedWindows = 0;
+  let latestRelevantWindow = windows.length ? windows[windows.length - 1] : null;
+  let latestCleanAbsenceWindow = null;
+
+  for (let i = windows.length - 1; i >= 0; i--) {
+    const row = windows[i];
+
+    if (isCleanAbsenceWindow(row)) {
+      consecutiveCleanAbsenceWindows += 1;
+      if (!latestCleanAbsenceWindow) {
+        latestCleanAbsenceWindow = row;
       }
+    } else {
+      if (hasScannerCoverage(row)) contaminatedWindows += 1;
+      break;
     }
-  } else {
-    // PASS_BY mode: do not escalate to strong missing from consecutive windows.
-    consecutiveMissingWindows = 0;
-    contaminated = isContaminatedMissingWindow(latest);
+  }
+
+  if (!latestRelevantWindow && latestCleanAbsenceWindow) {
+    latestRelevantWindow = latestCleanAbsenceWindow;
   }
 
   return {
-    ...latest,
-    consecutive_missing_windows: consecutiveMissingWindows,
-    fusion_mode: fusionMode,
-    contaminated_missing_window: contaminated
+    encounter_profile: encounterProfile,
+    scanner_coverage_present: scannerCoveragePresent,
+    identity_present_any:
+      identitySeenInWindows || identitySeenInScans,
+    valid_match_present_any: validMatchSeenInScans,
+    relay_present_any:
+      relaySeenInWindows || relaySeenInScans,
+    consecutive_clean_absence_windows: consecutiveCleanAbsenceWindows,
+    contaminated_windows: contaminatedWindows,
+    window_count: windows.length,
+    scan_count: scans.length,
+    latest_relevant_window: latestRelevantWindow,
+    latest_clean_absence_window: latestCleanAbsenceWindow
   };
 }
 
 function shouldCreateEvidenceWindow(decisionType) {
   return [
     "UUID_MISSING",
+    "NO_SCANNER_EVIDENCE",
     "NOT_ENROLLED",
     "REPLAY_SUSPECT",
     "COUNTER_ROLLBACK",
@@ -475,6 +537,7 @@ async function createEvidenceWindow({
           : "Auto-generated evidence window",
         verdict: finalFusion.fusion_verdict
       },
+      encounter_summary: finalFusion?.raw_json?.encounter_summary || null,
       window_summary: {
         window_start: pass.first_seen_at || null,
         window_end: pass.last_seen_at || null
@@ -494,7 +557,6 @@ async function createEvidenceWindow({
         nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
       },
       scanner_window_evidence: finalFusion?.raw_json?.fallback_scanner_window || null,
-      fusion_mode: finalFusion?.raw_json?.fusion_mode || null,
       transition: {
         last_valid_scan_id: lastValidScan?.id ?? null,
         last_valid_scan_ts: lastValidScan?.created_at ?? null,
@@ -718,6 +780,44 @@ async function enrichSingleEvidenceWindow(ew) {
   }
 }
 
+async function buildEncounterPolicyContext({ plate, anchorTs, anprEvent, aiEvent }) {
+  const windows = await getEncounterWindows({ plate, anchorTs });
+  const scans = await getEncounterScans({ plate, anchorTs });
+
+  return summariseEncounter({
+    windows,
+    scans,
+    anprEvent,
+    aiEvent
+  });
+}
+
+function attachEncounterSummary(finalFusion, encounterSummary) {
+  finalFusion.raw_json = {
+    ...(finalFusion.raw_json || {}),
+    encounter_summary: encounterSummary
+  };
+  return finalFusion;
+}
+
+function makePolicyVerdict({
+  fusion_verdict,
+  reasons,
+  pass,
+  encounterSummary
+}) {
+  return attachEncounterSummary({
+    fusion_verdict,
+    final_label: fusion_verdict,
+    visual_confidence: pass.visual_confidence || "NONE",
+    reasons,
+    plate: pass.plate,
+    has_gotid: pass.has_gotid_expected,
+    registry_status: pass.registry_status,
+    raw_json: {}
+  }, encounterSummary);
+}
+
 async function processJobs() {
   try {
     const jobs = await query(`
@@ -795,7 +895,6 @@ async function processSingleJob(job) {
     );
 
     const ai = aiRes.rows[0] || null;
-    const fusionMode = chooseFusionMode({ anprEvent: anpr, aiEvent: ai });
 
     let registryVehicle = null;
     let observedPubkeyHex = "";
@@ -874,12 +973,19 @@ async function processSingleJob(job) {
     }
 
     const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
-
-    const scannerWindowEvidence = await findScannerWindowEvidence({
+    const encounterSummary = await buildEncounterPolicyContext({
       plate,
       anchorTs: anpr.ts,
-      fusionMode
+      anprEvent: anpr,
+      aiEvent: ai
     });
+
+    const scannerWindowEvidence = encounterSummary.latest_relevant_window
+      ? buildFallbackWindowForFusion(
+          encounterSummary.latest_relevant_window,
+          encounterSummary.consecutive_clean_absence_windows
+        )
+      : null;
 
     const pass = await getOrCreateOpenPass({
       plate,
@@ -901,7 +1007,7 @@ async function processSingleJob(job) {
 
     provisional.raw_json = {
       ...(provisional.raw_json || {}),
-      fusion_mode: fusionMode
+      encounter_summary: encounterSummary
     };
 
     await updatePassWithEvidence({
@@ -923,13 +1029,15 @@ async function processSingleJob(job) {
         latestScan: scan,
         registryVehicle,
         scanEventForFusion,
+        encounterSummary,
         scannerWindowEvidence,
-        fusionMode,
         provisional: {
           fusion_verdict: "MATCH",
           visual_confidence: provisional.visual_confidence || "NONE",
           reasons: Array.isArray(provisional.reasons) ? provisional.reasons : [],
-          raw_json: { fusion_mode: fusionMode }
+          raw_json: {
+            encounter_summary: encounterSummary
+          }
         }
       });
     }
@@ -1050,7 +1158,7 @@ async function updatePassWithEvidence({ pass, anpr, ai, scan, registryVehicle, p
     latest_ai_id: ai?.id ?? null,
     latest_scan_id: scan?.id ?? null,
     registry_vehicle_id: registryVehicle?.id ?? null,
-    fusion_mode: provisional?.raw_json?.fusion_mode || null
+    encounter_summary: provisional?.raw_json?.encounter_summary || null
   };
 
   await query(
@@ -1103,7 +1211,7 @@ async function tryFinalisePass({
   scanEventForFusion,
   provisional,
   scannerWindowEvidence = null,
-  fusionMode = "PASS_BY"
+  encounterSummary = null
 }) {
   const res = await query(`SELECT * FROM fusion_passes WHERE id = $1 LIMIT 1`, [passId]);
   const pass = res.rows[0];
@@ -1140,10 +1248,7 @@ async function tryFinalisePass({
       allowMissingDecision: false,
       scannerWindowEvidence
     });
-    finalFusion.raw_json = {
-      ...(finalFusion.raw_json || {}),
-      fusion_mode: fusionMode
-    };
+    attachEncounterSummary(finalFusion, encounterSummary);
   } else if (
     hasStrongSuspicion &&
     passAge !== null &&
@@ -1151,18 +1256,12 @@ async function tryFinalisePass({
     idleAge !== null &&
     idleAge >= PASS_IDLE_FINALISE_SEC
   ) {
-    finalFusion = {
+    finalFusion = makePolicyVerdict({
       fusion_verdict: strongest,
-      final_label: strongest,
-      visual_confidence: pass.visual_confidence || "NONE",
       reasons: Array.isArray(pass.reasons) ? pass.reasons : [],
-      plate: pass.plate,
-      has_gotid: pass.has_gotid_expected,
-      registry_status: pass.registry_status,
-      raw_json: {
-        fusion_mode: fusionMode
-      }
-    };
+      pass,
+      encounterSummary
+    });
   } else if (
     isMissingCandidate &&
     passAge !== null &&
@@ -1170,28 +1269,57 @@ async function tryFinalisePass({
     idleAge !== null &&
     idleAge >= PASS_IDLE_FINALISE_SEC
   ) {
-    const fallbackScannerWindowEvidence =
-      scannerWindowEvidence ||
-      await findScannerWindowEvidence({
-        plate: pass.plate,
-        anchorTs: latestAnpr?.ts || pass.last_seen_at || pass.first_seen_at,
-        fusionMode
+    if (encounterSummary?.identity_present_any === true) {
+      if (encounterSummary?.relay_present_any === true) {
+        finalFusion = makePolicyVerdict({
+          fusion_verdict: "RELAY_SUSPECT",
+          reasons: [
+            "Identity was seen during the encounter and at least one relay-style failure occurred, so true missing cannot be claimed."
+          ],
+          pass,
+          encounterSummary
+        });
+      } else {
+        finalFusion = makePolicyVerdict({
+          fusion_verdict: "NO_SCANNER_EVIDENCE",
+          reasons: [
+            "Identity was seen during the encounter, so true missing cannot be claimed from this encounter summary."
+          ],
+          pass,
+          encounterSummary
+        });
+      }
+    } else if (encounterSummary?.scanner_coverage_present !== true) {
+      finalFusion = makePolicyVerdict({
+        fusion_verdict: "NO_SCANNER_EVIDENCE",
+        reasons: [
+          "Scanner coverage was not proven strongly enough to support a missing-tag conclusion."
+        ],
+        pass,
+        encounterSummary
+      });
+    } else {
+      const fallbackScannerWindowEvidence =
+        scannerWindowEvidence ||
+        (encounterSummary?.latest_clean_absence_window
+          ? buildFallbackWindowForFusion(
+              encounterSummary.latest_clean_absence_window,
+              encounterSummary.consecutive_clean_absence_windows
+            )
+          : null);
+
+      finalFusion = decideFusion({
+        registryVehicle,
+        scanEvent: null,
+        anprEvent: latestAnpr,
+        aiEvent: latestAi,
+        lastCounter: null,
+        allowMissingDecision: true,
+        scannerWindowEvidence: fallbackScannerWindowEvidence
       });
 
-    finalFusion = decideFusion({
-      registryVehicle,
-      scanEvent: null,
-      anprEvent: latestAnpr,
-      aiEvent: latestAi,
-      lastCounter: null,
-      allowMissingDecision: true,
-      scannerWindowEvidence: fallbackScannerWindowEvidence
-    });
-
-    finalFusion.raw_json = {
-      ...(finalFusion.raw_json || {}),
-      fusion_mode: fusionMode
-    };
+      attachEncounterSummary(finalFusion, encounterSummary);
+    }
   } else if (
     idleAge !== null &&
     idleAge >= PASS_IDLE_FINALISE_SEC &&
@@ -1206,10 +1334,7 @@ async function tryFinalisePass({
       allowMissingDecision: false,
       scannerWindowEvidence
     });
-    finalFusion.raw_json = {
-      ...(finalFusion.raw_json || {}),
-      fusion_mode: fusionMode
-    };
+    attachEncounterSummary(finalFusion, encounterSummary);
   }
 
   if (!finalFusion) return null;
@@ -1237,6 +1362,8 @@ async function tryFinalisePass({
     finalFusion.final_label = "NOT_ENROLLED";
   } else if (finalFusion.fusion_verdict === "UNKNOWN_TAG") {
     finalFusion.final_label = "UNREGISTERED_IDENTITY";
+  } else if (finalFusion.fusion_verdict === "NO_SCANNER_EVIDENCE") {
+    finalFusion.final_label = "NO_SCANNER_EVIDENCE";
   }
 
   const recentRes = await query(
@@ -1360,15 +1487,22 @@ async function finaliseMatureOpenPasses() {
       const anpr = anprRes.rows[0] || null;
       const ai = aiRes.rows[0] || null;
       const registryVehicle = regRes.rows[0] || null;
-      const fusionMode = chooseFusionMode({ anprEvent: anpr, aiEvent: ai });
 
       const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
-      const scannerWindowEvidence = await findScannerWindowEvidence({
+      const encounterSummary = await buildEncounterPolicyContext({
         plate: pass.plate,
         anchorTs: anpr?.ts || pass.last_seen_at || pass.first_seen_at,
-        fusionMode
+        anprEvent: anpr,
+        aiEvent: ai
       });
+
+      const scannerWindowEvidence = encounterSummary.latest_relevant_window
+        ? buildFallbackWindowForFusion(
+            encounterSummary.latest_relevant_window,
+            encounterSummary.consecutive_clean_absence_windows
+          )
+        : null;
 
       await tryFinalisePass({
         passId: pass.id,
@@ -1378,12 +1512,14 @@ async function finaliseMatureOpenPasses() {
         registryVehicle,
         scanEventForFusion,
         scannerWindowEvidence,
-        fusionMode,
+        encounterSummary,
         provisional: {
           fusion_verdict: pass.final_fusion_verdict || "PENDING",
           visual_confidence: pass.visual_confidence || "NONE",
           reasons: Array.isArray(pass.reasons) ? pass.reasons : [],
-          raw_json: { fusion_mode: fusionMode }
+          raw_json: {
+            encounter_summary: encounterSummary
+          }
         }
       });
     } catch (err) {
