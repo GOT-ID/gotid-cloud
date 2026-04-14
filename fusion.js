@@ -511,10 +511,7 @@ export function decideFusion({
     } else if (missingGrade === "STRONG") {
       fused.final_label = "UUID_MISSING_STRONG";
     } else if (missingGrade === "USABLE") {
-      fused.final_label =
-        fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
-          ? "CLONE_SUSPECT_MISSING_TAG_STRONG"
-          : "CLONE_SUSPECT_MISSING_TAG_WEAK";
+      fused.final_label = "CLONE_SUSPECT_MISSING_TAG";
     } else {
       fused.final_label = "UUID_MISSING";
     }
