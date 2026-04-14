@@ -119,11 +119,37 @@ function pushReason(arr, msg) {
   if (!arr.includes(msg)) arr.push(msg);
 }
 
+function buildFallbackScannerWindow(scannerWindowEvidence) {
+  if (!scannerWindowEvidence) return null;
+
+  return {
+    id: scannerWindowEvidence.id,
+    plate: scannerWindowEvidence.plate || null,
+    camera_id: scannerWindowEvidence.camera_id || null,
+    scanner_id: scannerWindowEvidence.scanner_id || null,
+    window_start: scannerWindowEvidence.window_start || null,
+    window_end: scannerWindowEvidence.window_end || null,
+    ble_packets_seen: toInt(scannerWindowEvidence.ble_packets_seen, 0),
+    ble_devices_seen: toInt(scannerWindowEvidence.ble_devices_seen, 0),
+    companyid_hits_seen: toInt(scannerWindowEvidence.companyid_hits_seen, 0),
+    gotid_candidates_seen: toInt(scannerWindowEvidence.gotid_candidates_seen, 0),
+    strongest_rssi: scannerWindowEvidence.strongest_rssi,
+    nearest_est_distance_m: scannerWindowEvidence.nearest_est_distance_m,
+    valid_uuid_seen: boolish(scannerWindowEvidence.valid_uuid_seen),
+    valid_sig_seen: boolish(scannerWindowEvidence.valid_sig_seen),
+    valid_chal_seen: boolish(scannerWindowEvidence.valid_chal_seen),
+    pk_match_seen: boolish(scannerWindowEvidence.pk_match_seen),
+    consecutive_missing_windows: toInt(scannerWindowEvidence.consecutive_missing_windows, 0)
+  };
+}
+
 function evaluateScannerWindowEvidence(ev) {
   if (!ev) {
     return {
       usable: false,
       strong: false,
+      veryStrong: false,
+      consecutiveMissingWindows: 0,
       reasons: ["No fallback scanner evidence window found."]
     };
   }
@@ -139,6 +165,8 @@ function evaluateScannerWindowEvidence(ev) {
   const validSigSeen = boolish(ev.valid_sig_seen);
   const validChalSeen = boolish(ev.valid_chal_seen);
   const pkMatchSeen = boolish(ev.pk_match_seen);
+
+  const consecutiveMissingWindows = toInt(ev.consecutive_missing_windows, 0);
 
   const scannerAlive =
     blePacketsSeen > 0 ||
@@ -156,9 +184,14 @@ function evaluateScannerWindowEvidence(ev) {
   const usable = scannerAlive;
 
   const strong =
-    bleDevicesSeen > 0 &&
-    (companyIdHits > 0 || gotidCandidates > 0 || strongestRssi !== null) &&
-    noValidIdentity;
+    scannerAlive &&
+    noValidIdentity &&
+    consecutiveMissingWindows >= 2;
+
+  const veryStrong =
+    scannerAlive &&
+    noValidIdentity &&
+    consecutiveMissingWindows >= 3;
 
   const reasons = [];
 
@@ -176,7 +209,9 @@ function evaluateScannerWindowEvidence(ev) {
     reasons.push("A valid UUID/signature/challenge/pubkey match was observed, so UUID_MISSING is not valid.");
   }
 
-  return { usable, strong, reasons };
+  reasons.push(`Consecutive clean missing windows observed: ${consecutiveMissingWindows}`);
+
+  return { usable, strong, veryStrong, consecutiveMissingWindows, reasons };
 }
 
 export function decideFusion({
@@ -278,6 +313,7 @@ export function decideFusion({
       if (!scanEvent || !hasIdentity) {
         if (allowMissingDecision === true) {
           const evEval = evaluateScannerWindowEvidence(scannerWindowEvidence);
+          const fallbackScannerWindow = buildFallbackScannerWindow(scannerWindowEvidence);
 
           pushReason(fused.reasons, "Enrolled vehicle but no GOT-ID identity was captured within scan window.");
 
@@ -285,30 +321,22 @@ export function decideFusion({
             pushReason(fused.reasons, r);
           }
 
-          if (evEval.strong) {
+          if (evEval.veryStrong) {
             fused.fusion_verdict = "UUID_MISSING";
             fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
             fused.raw_json = {
               ...(fused.raw_json || {}),
               fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              fallback_scanner_window: scannerWindowEvidence ? {
-                id: scannerWindowEvidence.id,
-                plate: scannerWindowEvidence.plate || null,
-                camera_id: scannerWindowEvidence.camera_id || null,
-                scanner_id: scannerWindowEvidence.scanner_id || null,
-                window_start: scannerWindowEvidence.window_start || null,
-                window_end: scannerWindowEvidence.window_end || null,
-                ble_packets_seen: toInt(scannerWindowEvidence.ble_packets_seen, 0),
-                ble_devices_seen: toInt(scannerWindowEvidence.ble_devices_seen, 0),
-                companyid_hits_seen: toInt(scannerWindowEvidence.companyid_hits_seen, 0),
-                gotid_candidates_seen: toInt(scannerWindowEvidence.gotid_candidates_seen, 0),
-                strongest_rssi: scannerWindowEvidence.strongest_rssi,
-                nearest_est_distance_m: scannerWindowEvidence.nearest_est_distance_m,
-                valid_uuid_seen: boolish(scannerWindowEvidence.valid_uuid_seen),
-                valid_sig_seen: boolish(scannerWindowEvidence.valid_sig_seen),
-                valid_chal_seen: boolish(scannerWindowEvidence.valid_chal_seen),
-                pk_match_seen: boolish(scannerWindowEvidence.pk_match_seen)
-              } : null,
+              fallback_scanner_window: fallbackScannerWindow,
+              missing_evidence_grade: "VERY_STRONG"
+            };
+          } else if (evEval.strong) {
+            fused.fusion_verdict = "UUID_MISSING";
+            fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
+            fused.raw_json = {
+              ...(fused.raw_json || {}),
+              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
+              fallback_scanner_window: fallbackScannerWindow,
               missing_evidence_grade: "STRONG"
             };
           } else if (evEval.usable) {
@@ -317,24 +345,7 @@ export function decideFusion({
             fused.raw_json = {
               ...(fused.raw_json || {}),
               fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              fallback_scanner_window: scannerWindowEvidence ? {
-                id: scannerWindowEvidence.id,
-                plate: scannerWindowEvidence.plate || null,
-                camera_id: scannerWindowEvidence.camera_id || null,
-                scanner_id: scannerWindowEvidence.scanner_id || null,
-                window_start: scannerWindowEvidence.window_start || null,
-                window_end: scannerWindowEvidence.window_end || null,
-                ble_packets_seen: toInt(scannerWindowEvidence.ble_packets_seen, 0),
-                ble_devices_seen: toInt(scannerWindowEvidence.ble_devices_seen, 0),
-                companyid_hits_seen: toInt(scannerWindowEvidence.companyid_hits_seen, 0),
-                gotid_candidates_seen: toInt(scannerWindowEvidence.gotid_candidates_seen, 0),
-                strongest_rssi: scannerWindowEvidence.strongest_rssi,
-                nearest_est_distance_m: scannerWindowEvidence.nearest_est_distance_m,
-                valid_uuid_seen: boolish(scannerWindowEvidence.valid_uuid_seen),
-                valid_sig_seen: boolish(scannerWindowEvidence.valid_sig_seen),
-                valid_chal_seen: boolish(scannerWindowEvidence.valid_chal_seen),
-                pk_match_seen: boolish(scannerWindowEvidence.pk_match_seen)
-              } : null,
+              fallback_scanner_window: fallbackScannerWindow,
               missing_evidence_grade: "USABLE"
             };
           } else {
@@ -495,7 +506,9 @@ export function decideFusion({
   } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
     const missingGrade = fused.raw_json?.missing_evidence_grade || "NONE";
 
-    if (missingGrade === "STRONG") {
+    if (missingGrade === "VERY_STRONG") {
+      fused.final_label = "UUID_MISSING_VERY_STRONG";
+    } else if (missingGrade === "STRONG") {
       fused.final_label = "UUID_MISSING_STRONG";
     } else if (missingGrade === "USABLE") {
       fused.final_label =
