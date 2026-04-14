@@ -317,13 +317,13 @@ async function createEvidenceWindow({
         worker_status: "DONE"
       },
       radio_environment: {
-        ble_packets_seen: null,
-        ble_devices_seen: null,
-        companyid_hits_seen: null,
-        gotid_candidates_seen: null,
-        strongest_rssi: latestScan?.rssi ?? null,
-        nearest_est_distance_m: latestScan?.est_distance_m ?? null
-      },
+  ble_packets_seen: latestScan?.raw_json?.ble_packets_seen ?? null,
+  ble_devices_seen: latestScan?.raw_json?.ble_devices_seen ?? null,
+  companyid_hits_seen: latestScan?.raw_json?.companyid_hits_seen ?? null,
+  gotid_candidates_seen: latestScan?.raw_json?.gotid_candidates_seen ?? null,
+  strongest_rssi: latestScan?.rssi ?? latestScan?.raw_json?.rssi ?? null,
+  nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
+},
       transition: {
         last_valid_scan_id: lastValidScan?.id ?? null,
         last_valid_scan_ts: lastValidScan?.created_at ?? null,
