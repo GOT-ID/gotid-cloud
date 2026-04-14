@@ -12,7 +12,7 @@ const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisati
 const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
-console.log("🚨 WORKER VERSION: evidence enrichment debug build loaded");
+console.log("🚨 WORKER VERSION: scanner_window_events missing-evidence build loaded");
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -221,6 +221,30 @@ function buildScanEventForFusion(scan, registryVehicle) {
   };
 }
 
+async function findScannerWindowEvidence({ plate, anchorTs }) {
+  const p = normPlate(plate);
+  if (!p || !anchorTs) return null;
+
+  const res = await query(
+    `
+    SELECT *
+    FROM scanner_window_events
+    WHERE plate = $1
+      AND window_start <= ($2::timestamptz + INTERVAL '10 seconds')
+      AND window_end   >= ($2::timestamptz - INTERVAL '10 seconds')
+    ORDER BY
+      ABS(EXTRACT(EPOCH FROM (
+        $2::timestamptz - (window_start + ((window_end - window_start) / 2))
+      ))) ASC,
+      created_at DESC
+    LIMIT 1
+    `,
+    [p, anchorTs]
+  );
+
+  return res.rows[0] || null;
+}
+
 function shouldCreateEvidenceWindow(decisionType) {
   return [
     "UUID_MISSING",
@@ -317,13 +341,14 @@ async function createEvidenceWindow({
         worker_status: "DONE"
       },
       radio_environment: {
-  ble_packets_seen: latestScan?.raw_json?.ble_packets_seen ?? null,
-  ble_devices_seen: latestScan?.raw_json?.ble_devices_seen ?? null,
-  companyid_hits_seen: latestScan?.raw_json?.companyid_hits_seen ?? null,
-  gotid_candidates_seen: latestScan?.raw_json?.gotid_candidates_seen ?? null,
-  strongest_rssi: latestScan?.rssi ?? latestScan?.raw_json?.rssi ?? null,
-  nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
-},
+        ble_packets_seen: latestScan?.raw_json?.ble_packets_seen ?? null,
+        ble_devices_seen: latestScan?.raw_json?.ble_devices_seen ?? null,
+        companyid_hits_seen: latestScan?.raw_json?.companyid_hits_seen ?? null,
+        gotid_candidates_seen: latestScan?.raw_json?.gotid_candidates_seen ?? null,
+        strongest_rssi: latestScan?.rssi ?? latestScan?.raw_json?.rssi ?? null,
+        nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
+      },
+      scanner_window_evidence: finalFusion?.raw_json?.fallback_scanner_window || null,
       transition: {
         last_valid_scan_id: lastValidScan?.id ?? null,
         last_valid_scan_ts: lastValidScan?.created_at ?? null,
@@ -456,40 +481,39 @@ async function enrichSingleEvidenceWindow(ew) {
     );
 
     const firstReturn = returnRes.rows[0] || null;
-    // --- compute gap + classification ---
-let gapSeconds = null;
-let returnClassification = null;
-let decisionConfidence = "MEDIUM";
 
-if (ew.last_valid_scan_ts && firstReturn.created_at) {
-  const last = new Date(ew.last_valid_scan_ts).getTime();
-  const ret = new Date(firstReturn.created_at).getTime();
+    let gapSeconds = null;
+    let returnClassification = null;
+    let decisionConfidence = "MEDIUM";
 
-  if (Number.isFinite(last) && Number.isFinite(ret)) {
-    gapSeconds = (ret - last) / 1000;
+    if (ew.last_valid_scan_ts && firstReturn?.created_at) {
+      const last = new Date(ew.last_valid_scan_ts).getTime();
+      const ret = new Date(firstReturn.created_at).getTime();
 
-    if (gapSeconds < 10) {
-      returnClassification = "NORMAL_RETURN";
-    } else if (gapSeconds < 30) {
-      returnClassification = "DELAYED_RETURN";
-    } else {
-      returnClassification = "SUSPICIOUS_RETURN";
+      if (Number.isFinite(last) && Number.isFinite(ret)) {
+        gapSeconds = (ret - last) / 1000;
+
+        if (gapSeconds < 10) {
+          returnClassification = "NORMAL_RETURN";
+        } else if (gapSeconds < 30) {
+          returnClassification = "DELAYED_RETURN";
+        } else {
+          returnClassification = "SUSPICIOUS_RETURN";
+        }
+      }
     }
-  }
-}
 
-// decision confidence
-if (
-  ew.decision_type === "RELAY_SUSPECT" ||
-  ew.decision_type === "REPLAY_SUSPECT" ||
-  ew.decision_type === "INVALID_TAG"
-) {
-  decisionConfidence = "HIGH";
-} else if (ew.decision_type === "UUID_MISSING") {
-  decisionConfidence = "MEDIUM";
-} else {
-  decisionConfidence = "LOW";
-}
+    if (
+      ew.decision_type === "RELAY_SUSPECT" ||
+      ew.decision_type === "REPLAY_SUSPECT" ||
+      ew.decision_type === "INVALID_TAG"
+    ) {
+      decisionConfidence = "HIGH";
+    } else if (ew.decision_type === "UUID_MISSING") {
+      decisionConfidence = "MEDIUM";
+    } else {
+      decisionConfidence = "LOW";
+    }
 
     if (!firstReturn) {
       console.log(`⏭️ no return scan found yet for evidence window ${ew.id}`);
@@ -508,8 +532,8 @@ if (
         nearest_est_distance_m = COALESCE(nearest_est_distance_m, $5::numeric),
         scanner_id = COALESCE(scanner_id, $6::text),
         gap_seconds = COALESCE(gap_seconds, $7),
-return_classification = COALESCE(return_classification, $8),
-decision_confidence = COALESCE(decision_confidence, $9),
+        return_classification = COALESCE(return_classification, $8),
+        decision_confidence = COALESCE(decision_confidence, $9),
         raw_json = jsonb_set(
           jsonb_set(
             COALESCE(raw_json, '{}'::jsonb),
@@ -530,16 +554,16 @@ decision_confidence = COALESCE(decision_confidence, $9),
         AND first_return_scan_id IS NULL
       `,
       [
-  ew.id,
-  firstReturn.id,
-  firstReturn.created_at,
-  firstReturn.rssi ?? null,
-  firstReturn.est_distance_m ?? null,
-  firstReturn.scanner_id || "SCN-001",
-  gapSeconds,
-  returnClassification,
-  decisionConfidence
-]
+        ew.id,
+        firstReturn.id,
+        firstReturn.created_at,
+        firstReturn.rssi ?? null,
+        firstReturn.est_distance_m ?? null,
+        firstReturn.scanner_id || "SCN-001",
+        gapSeconds,
+        returnClassification,
+        decisionConfidence
+      ]
     );
 
     console.log(`🧾 Evidence window ${ew.id} enriched with return scan ${firstReturn.id}`);
@@ -704,6 +728,11 @@ async function processSingleJob(job) {
 
     const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
+    const scannerWindowEvidence = await findScannerWindowEvidence({
+      plate,
+      anchorTs: anpr.ts
+    });
+
     const pass = await getOrCreateOpenPass({
       plate,
       anpr,
@@ -718,7 +747,8 @@ async function processSingleJob(job) {
       anprEvent: anpr,
       aiEvent: ai,
       lastCounter,
-      allowMissingDecision: false
+      allowMissingDecision: false,
+      scannerWindowEvidence
     });
 
     await updatePassWithEvidence({
@@ -740,6 +770,7 @@ async function processSingleJob(job) {
         latestScan: scan,
         registryVehicle,
         scanEventForFusion,
+        scannerWindowEvidence,
         provisional: {
           fusion_verdict: "MATCH",
           visual_confidence: provisional.visual_confidence || "NONE",
@@ -914,7 +945,8 @@ async function tryFinalisePass({
   latestScan,
   registryVehicle,
   scanEventForFusion,
-  provisional
+  provisional,
+  scannerWindowEvidence = null
 }) {
   const res = await query(`SELECT * FROM fusion_passes WHERE id = $1 LIMIT 1`, [passId]);
   const pass = res.rows[0];
@@ -948,7 +980,8 @@ async function tryFinalisePass({
       anprEvent: latestAnpr,
       aiEvent: latestAi,
       lastCounter: null,
-      allowMissingDecision: false
+      allowMissingDecision: false,
+      scannerWindowEvidence
     });
   } else if (
     hasStrongSuspicion &&
@@ -964,7 +997,8 @@ async function tryFinalisePass({
       reasons: Array.isArray(pass.reasons) ? pass.reasons : [],
       plate: pass.plate,
       has_gotid: pass.has_gotid_expected,
-      registry_status: pass.registry_status
+      registry_status: pass.registry_status,
+      raw_json: {}
     };
   } else if (
     isMissingCandidate &&
@@ -973,13 +1007,21 @@ async function tryFinalisePass({
     idleAge !== null &&
     idleAge >= PASS_IDLE_FINALISE_SEC
   ) {
+    const fallbackScannerWindowEvidence =
+      scannerWindowEvidence ||
+      await findScannerWindowEvidence({
+        plate: pass.plate,
+        anchorTs: latestAnpr?.ts || pass.last_seen_at || pass.first_seen_at
+      });
+
     finalFusion = decideFusion({
       registryVehicle,
       scanEvent: null,
       anprEvent: latestAnpr,
       aiEvent: latestAi,
       lastCounter: null,
-      allowMissingDecision: true
+      allowMissingDecision: true,
+      scannerWindowEvidence: fallbackScannerWindowEvidence
     });
   } else if (
     idleAge !== null &&
@@ -992,7 +1034,8 @@ async function tryFinalisePass({
       anprEvent: latestAnpr,
       aiEvent: latestAi,
       lastCounter: null,
-      allowMissingDecision: false
+      allowMissingDecision: false,
+      scannerWindowEvidence
     });
   }
 
@@ -1147,6 +1190,11 @@ async function finaliseMatureOpenPasses() {
 
       const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
+      const scannerWindowEvidence = await findScannerWindowEvidence({
+        plate: pass.plate,
+        anchorTs: anpr?.ts || pass.last_seen_at || pass.first_seen_at
+      });
+
       await tryFinalisePass({
         passId: pass.id,
         latestAnpr: anpr,
@@ -1154,6 +1202,7 @@ async function finaliseMatureOpenPasses() {
         latestScan: scan,
         registryVehicle,
         scanEventForFusion,
+        scannerWindowEvidence,
         provisional: {
           fusion_verdict: pass.final_fusion_verdict || "PENDING",
           visual_confidence: pass.visual_confidence || "NONE",
