@@ -105,20 +105,95 @@ function toMs(ts) {
   return Number.isFinite(t) ? t : null;
 }
 
+function boolish(v) {
+  return v === true || v === "true" || v === 1 || v === "1";
+}
+
+function toInt(v, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+
+function pushReason(arr, msg) {
+  if (!Array.isArray(arr)) return;
+  if (!arr.includes(msg)) arr.push(msg);
+}
+
+function evaluateScannerWindowEvidence(ev) {
+  if (!ev) {
+    return {
+      usable: false,
+      strong: false,
+      reasons: ["No fallback scanner evidence window found."]
+    };
+  }
+
+  const blePacketsSeen = toInt(ev.ble_packets_seen, 0);
+  const bleDevicesSeen = toInt(ev.ble_devices_seen, 0);
+  const companyIdHits = toInt(ev.companyid_hits_seen, 0);
+  const gotidCandidates = toInt(ev.gotid_candidates_seen, 0);
+  const strongestRssi =
+    ev.strongest_rssi == null ? null : toInt(ev.strongest_rssi, null);
+
+  const validUuidSeen = boolish(ev.valid_uuid_seen);
+  const validSigSeen = boolish(ev.valid_sig_seen);
+  const validChalSeen = boolish(ev.valid_chal_seen);
+  const pkMatchSeen = boolish(ev.pk_match_seen);
+
+  const scannerAlive =
+    blePacketsSeen > 0 ||
+    bleDevicesSeen > 0 ||
+    companyIdHits > 0 ||
+    gotidCandidates > 0 ||
+    strongestRssi !== null;
+
+  const noValidIdentity =
+    !validUuidSeen &&
+    !validSigSeen &&
+    !validChalSeen &&
+    !pkMatchSeen;
+
+  const usable = scannerAlive;
+
+  const strong =
+    bleDevicesSeen > 0 &&
+    (companyIdHits > 0 || gotidCandidates > 0 || strongestRssi !== null) &&
+    noValidIdentity;
+
+  const reasons = [];
+
+  if (scannerAlive) {
+    reasons.push(
+      `Scanner evidence window active: ble_packets_seen=${blePacketsSeen}, ble_devices_seen=${bleDevicesSeen}, companyid_hits_seen=${companyIdHits}, gotid_candidates_seen=${gotidCandidates}, strongest_rssi=${strongestRssi ?? "null"}`
+    );
+  } else {
+    reasons.push("Fallback scanner evidence window exists but does not prove scanner activity strongly enough.");
+  }
+
+  if (noValidIdentity) {
+    reasons.push("No valid GOT-ID UUID, signature, challenge result, or pubkey match was observed in the scanner evidence window.");
+  } else {
+    reasons.push("A valid UUID/signature/challenge/pubkey match was observed, so UUID_MISSING is not valid.");
+  }
+
+  return { usable, strong, reasons };
+}
+
 export function decideFusion({
   registryVehicle,
   scanEvent,
   anprEvent,
   aiEvent,
   lastCounter,
-  allowMissingDecision = false
+  allowMissingDecision = false,
+  scannerWindowEvidence = null
 }) {
   const cloudVerdict = scanEvent?.cloud_verdict || null;
   const scannerResult = scanEvent?.scanner_result || null;
 
   const hasIdentity =
-  scanEvent?.has_identity === true ||
-  scanEvent?.pubkey_match === true;
+    scanEvent?.has_identity === true ||
+    scanEvent?.pubkey_match === true;
 
   const fused = {
     fusion_verdict: null,
@@ -145,7 +220,8 @@ export function decideFusion({
 
     anpr: anprEvent || null,
     ai: aiEvent || null,
-    scan: scanEvent || null
+    scan: scanEvent || null,
+    raw_json: {}
   };
 
   // ---------------------------------------------------------------------------
@@ -201,8 +277,75 @@ export function decideFusion({
     } else {
       if (!scanEvent || !hasIdentity) {
         if (allowMissingDecision === true) {
-          fused.fusion_verdict = "UUID_MISSING";
-          fused.reasons.push("Enrolled vehicle but no GOT-ID identity was captured within scan window.");
+          const evEval = evaluateScannerWindowEvidence(scannerWindowEvidence);
+
+          pushReason(fused.reasons, "Enrolled vehicle but no GOT-ID identity was captured within scan window.");
+
+          for (const r of evEval.reasons) {
+            pushReason(fused.reasons, r);
+          }
+
+          if (evEval.strong) {
+            fused.fusion_verdict = "UUID_MISSING";
+            fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
+            fused.raw_json = {
+              ...(fused.raw_json || {}),
+              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
+              fallback_scanner_window: scannerWindowEvidence ? {
+                id: scannerWindowEvidence.id,
+                plate: scannerWindowEvidence.plate || null,
+                camera_id: scannerWindowEvidence.camera_id || null,
+                scanner_id: scannerWindowEvidence.scanner_id || null,
+                window_start: scannerWindowEvidence.window_start || null,
+                window_end: scannerWindowEvidence.window_end || null,
+                ble_packets_seen: toInt(scannerWindowEvidence.ble_packets_seen, 0),
+                ble_devices_seen: toInt(scannerWindowEvidence.ble_devices_seen, 0),
+                companyid_hits_seen: toInt(scannerWindowEvidence.companyid_hits_seen, 0),
+                gotid_candidates_seen: toInt(scannerWindowEvidence.gotid_candidates_seen, 0),
+                strongest_rssi: scannerWindowEvidence.strongest_rssi,
+                nearest_est_distance_m: scannerWindowEvidence.nearest_est_distance_m,
+                valid_uuid_seen: boolish(scannerWindowEvidence.valid_uuid_seen),
+                valid_sig_seen: boolish(scannerWindowEvidence.valid_sig_seen),
+                valid_chal_seen: boolish(scannerWindowEvidence.valid_chal_seen),
+                pk_match_seen: boolish(scannerWindowEvidence.pk_match_seen)
+              } : null,
+              missing_evidence_grade: "STRONG"
+            };
+          } else if (evEval.usable) {
+            fused.fusion_verdict = "UUID_MISSING";
+            fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
+            fused.raw_json = {
+              ...(fused.raw_json || {}),
+              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
+              fallback_scanner_window: scannerWindowEvidence ? {
+                id: scannerWindowEvidence.id,
+                plate: scannerWindowEvidence.plate || null,
+                camera_id: scannerWindowEvidence.camera_id || null,
+                scanner_id: scannerWindowEvidence.scanner_id || null,
+                window_start: scannerWindowEvidence.window_start || null,
+                window_end: scannerWindowEvidence.window_end || null,
+                ble_packets_seen: toInt(scannerWindowEvidence.ble_packets_seen, 0),
+                ble_devices_seen: toInt(scannerWindowEvidence.ble_devices_seen, 0),
+                companyid_hits_seen: toInt(scannerWindowEvidence.companyid_hits_seen, 0),
+                gotid_candidates_seen: toInt(scannerWindowEvidence.gotid_candidates_seen, 0),
+                strongest_rssi: scannerWindowEvidence.strongest_rssi,
+                nearest_est_distance_m: scannerWindowEvidence.nearest_est_distance_m,
+                valid_uuid_seen: boolish(scannerWindowEvidence.valid_uuid_seen),
+                valid_sig_seen: boolish(scannerWindowEvidence.valid_sig_seen),
+                valid_chal_seen: boolish(scannerWindowEvidence.valid_chal_seen),
+                pk_match_seen: boolish(scannerWindowEvidence.pk_match_seen)
+              } : null,
+              missing_evidence_grade: "USABLE"
+            };
+          } else {
+            fused.fusion_verdict = "NO_SCANNER_EVIDENCE";
+            fused.registry_status = "INSUFFICIENT_SCANNER_EVIDENCE";
+            fused.raw_json = {
+              ...(fused.raw_json || {}),
+              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
+              missing_evidence_grade: "NONE"
+            };
+          }
         } else {
           fused.fusion_verdict = "PENDING";
           fused.reasons.push("Enrolled vehicle pass is still awaiting identity evidence before deadline.");
@@ -245,38 +388,38 @@ export function decideFusion({
           }
         }
 
-    if (!fused.fusion_verdict) {
-  if (scanEvent.sig_valid === false) {
-    fused.fusion_verdict = "INVALID_TAG";
-    fused.reasons.push("Base signature verification failed.");
-  } else if (scanEvent.chal_valid === false) {
-    fused.fusion_verdict = "RELAY_SUSPECT";
-    fused.reasons.push("Challenge-response failed.");
-  } else if (scanEvent.pubkey_match === false) {
-    fused.fusion_verdict = "MISMATCH_PUBKEY";
-    fused.reasons.push("GOT-ID tag pubkey does not match registry.");
-  } else if (scanEvent.tamper === true) {
-    fused.fusion_verdict = "TAMPER";
-    fused.reasons.push("GOT-ID tag tamper input is active.");
-  } else if (
-    scanEvent.sig_valid === true &&
-    scanEvent.pubkey_match === true &&
-    scanEvent.chal_valid === true
-  ) {
-    fused.fusion_verdict = "MATCH";
-    fused.reasons.push("All cryptographic checks passed, pubkey matches registry, and live challenge-response succeeded.");
-  } else if (
-    scanEvent.sig_valid === true &&
-    scanEvent.pubkey_match === true &&
-    scanEvent.chal_valid !== false
-  ) {
-    fused.fusion_verdict = "MATCH_CRYPTO_ONLY";
-    fused.reasons.push("Cryptographic identity passed and pubkey matches registry, but live challenge was not confirmed.");
-  } else {
-    fused.fusion_verdict = "UNKNOWN_TAG";
-    fused.reasons.push("Identity evidence was present but insufficient to classify as a trusted match.");
-  }
-}
+        if (!fused.fusion_verdict) {
+          if (scanEvent.sig_valid === false) {
+            fused.fusion_verdict = "INVALID_TAG";
+            fused.reasons.push("Base signature verification failed.");
+          } else if (scanEvent.chal_valid === false) {
+            fused.fusion_verdict = "RELAY_SUSPECT";
+            fused.reasons.push("Challenge-response failed.");
+          } else if (scanEvent.pubkey_match === false) {
+            fused.fusion_verdict = "MISMATCH_PUBKEY";
+            fused.reasons.push("GOT-ID tag pubkey does not match registry.");
+          } else if (scanEvent.tamper === true) {
+            fused.fusion_verdict = "TAMPER";
+            fused.reasons.push("GOT-ID tag tamper input is active.");
+          } else if (
+            scanEvent.sig_valid === true &&
+            scanEvent.pubkey_match === true &&
+            scanEvent.chal_valid === true
+          ) {
+            fused.fusion_verdict = "MATCH";
+            fused.reasons.push("All cryptographic checks passed, pubkey matches registry, and live challenge-response succeeded.");
+          } else if (
+            scanEvent.sig_valid === true &&
+            scanEvent.pubkey_match === true &&
+            scanEvent.chal_valid !== false
+          ) {
+            fused.fusion_verdict = "MATCH_CRYPTO_ONLY";
+            fused.reasons.push("Cryptographic identity passed and pubkey matches registry, but live challenge was not confirmed.");
+          } else {
+            fused.fusion_verdict = "UNKNOWN_TAG";
+            fused.reasons.push("Identity evidence was present but insufficient to classify as a trusted match.");
+          }
+        }
       }
     }
   }
@@ -347,14 +490,24 @@ export function decideFusion({
         : "MATCH_WEAK_VISUAL";
   } else if (v === "PENDING") {
     fused.final_label = "PENDING";
-    } else if (v === "MATCH_CRYPTO_ONLY") {
-  fused.final_label = "MATCH_CRYPTO_ONLY";    
- } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
-  fused.final_label =
-    fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
-      ? "CLONE_SUSPECT_MISSING_TAG_STRONG"
-      : "CLONE_SUSPECT_MISSING_TAG_WEAK";
-} else if (v === "MISMATCH" || v === "MISMATCH_PUBKEY") {
+  } else if (v === "MATCH_CRYPTO_ONLY") {
+    fused.final_label = "MATCH_CRYPTO_ONLY";
+  } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
+    const missingGrade = fused.raw_json?.missing_evidence_grade || "NONE";
+
+    if (missingGrade === "STRONG") {
+      fused.final_label = "UUID_MISSING_STRONG";
+    } else if (missingGrade === "USABLE") {
+      fused.final_label =
+        fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
+          ? "CLONE_SUSPECT_MISSING_TAG_STRONG"
+          : "CLONE_SUSPECT_MISSING_TAG_WEAK";
+    } else {
+      fused.final_label = "UUID_MISSING";
+    }
+  } else if (v === "NO_SCANNER_EVIDENCE") {
+    fused.final_label = "NO_SCANNER_EVIDENCE";
+  } else if (v === "MISMATCH" || v === "MISMATCH_PUBKEY") {
     fused.final_label = "CLONE_SUSPECT";
   } else if (v === "REPLAY_SUSPECT" || v === "COUNTER_ROLLBACK") {
     fused.final_label = "REPLAY_SUSPECT";
