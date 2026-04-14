@@ -12,7 +12,7 @@ const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisati
 const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
-console.log("🚨 WORKER VERSION: scanner_window_events consecutive-missing build loaded");
+console.log("🚨 WORKER VERSION: scenario-aware honest-missing build loaded");
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -221,7 +221,112 @@ function buildScanEventForFusion(scan, registryVehicle) {
   };
 }
 
-async function findScannerWindowEvidence({ plate, anchorTs }) {
+function extractTrackAgeSeconds(ev) {
+  const candidates = [
+    ev?.raw_json?.raw_json?.track_age_s,
+    ev?.raw_json?.track_age_s
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function extractFramesSeen(ev) {
+  const candidates = [
+    ev?.raw_json?.raw_json?.frames_seen,
+    ev?.raw_json?.frames_seen
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function chooseFusionMode({ anprEvent, aiEvent }) {
+  const anprTrackAge = extractTrackAgeSeconds(anprEvent);
+  const aiTrackAge = extractTrackAgeSeconds(aiEvent);
+  const anprFrames = extractFramesSeen(anprEvent);
+  const aiFrames = extractFramesSeen(aiEvent);
+
+  const maxTrackAge = Math.max(
+    Number.isFinite(anprTrackAge) ? anprTrackAge : -1,
+    Number.isFinite(aiTrackAge) ? aiTrackAge : -1
+  );
+
+  const maxFrames = Math.max(
+    Number.isFinite(anprFrames) ? anprFrames : -1,
+    Number.isFinite(aiFrames) ? aiFrames : -1
+  );
+
+  // PASS_BY = brief sighting / drive-by
+  // OBSERVATION = longer tracked presence where multi-window absence is fair
+  if (
+    (Number.isFinite(maxTrackAge) && maxTrackAge >= 10) ||
+    (Number.isFinite(maxFrames) && maxFrames >= 10)
+  ) {
+    return "OBSERVATION";
+  }
+
+  return "PASS_BY";
+}
+
+function scannerResultFromWindow(row) {
+  const s = row?.raw_json?.scanner_result;
+  return typeof s === "string" ? s.toUpperCase().trim() : "";
+}
+
+function isCleanMissingWindow(row) {
+  const validUuidSeen = row.valid_uuid_seen === true;
+  const validSigSeen = row.valid_sig_seen === true;
+  const validChalSeen = row.valid_chal_seen === true;
+  const pkMatchSeen = row.pk_match_seen === true;
+  const scannerResult = scannerResultFromWindow(row);
+
+  const blePacketsSeen = Number(row.ble_packets_seen || 0);
+  const bleDevicesSeen = Number(row.ble_devices_seen || 0);
+  const companyIdHits = Number(row.companyid_hits_seen || 0);
+  const gotidCandidates = Number(row.gotid_candidates_seen || 0);
+  const strongestRssi = row.strongest_rssi;
+
+  const scannerAlive =
+    blePacketsSeen > 0 ||
+    bleDevicesSeen > 0 ||
+    companyIdHits > 0 ||
+    gotidCandidates > 0 ||
+    strongestRssi !== null;
+
+  if (!scannerAlive) return false;
+
+  if (validUuidSeen || validSigSeen || validChalSeen || pkMatchSeen) return false;
+
+  if (scannerResult === "RELAY_SUSPECT") return false;
+  if (scannerResult === "AUTHENTIC") return false;
+  if (scannerResult === "MATCH") return false;
+
+  return true;
+}
+
+function isContaminatedMissingWindow(row) {
+  if (!row) return false;
+
+  const validUuidSeen = row.valid_uuid_seen === true;
+  const validSigSeen = row.valid_sig_seen === true;
+  const validChalSeen = row.valid_chal_seen === true;
+  const pkMatchSeen = row.pk_match_seen === true;
+  const scannerResult = scannerResultFromWindow(row);
+
+  if (validUuidSeen || validSigSeen || validChalSeen || pkMatchSeen) return true;
+  if (scannerResult === "RELAY_SUSPECT") return true;
+  if (scannerResult === "AUTHENTIC") return true;
+  if (scannerResult === "MATCH") return true;
+
+  return false;
+}
+
+async function findScannerWindowEvidence({ plate, anchorTs, fusionMode = "PASS_BY" }) {
   const p = normPlate(plate);
   if (!p || !anchorTs) return null;
 
@@ -258,42 +363,30 @@ async function findScannerWindowEvidence({ plate, anchorTs }) {
   );
 
   let consecutiveMissingWindows = 0;
+  let contaminated = false;
 
-  for (const row of windowsRes.rows) {
-    const validUuidSeen = row.valid_uuid_seen === true;
-    const validSigSeen = row.valid_sig_seen === true;
-    const validChalSeen = row.valid_chal_seen === true;
-    const pkMatchSeen = row.pk_match_seen === true;
-
-    const blePacketsSeen = Number(row.ble_packets_seen || 0);
-    const bleDevicesSeen = Number(row.ble_devices_seen || 0);
-    const companyIdHits = Number(row.companyid_hits_seen || 0);
-    const gotidCandidates = Number(row.gotid_candidates_seen || 0);
-    const strongestRssi = row.strongest_rssi;
-
-    const scannerAlive =
-      blePacketsSeen > 0 ||
-      bleDevicesSeen > 0 ||
-      companyIdHits > 0 ||
-      gotidCandidates > 0 ||
-      strongestRssi !== null;
-
-    const noValidIdentity =
-      !validUuidSeen &&
-      !validSigSeen &&
-      !validChalSeen &&
-      !pkMatchSeen;
-
-    if (scannerAlive && noValidIdentity) {
-      consecutiveMissingWindows += 1;
-    } else {
-      break;
+  if (fusionMode === "OBSERVATION") {
+    for (const row of windowsRes.rows) {
+      if (isCleanMissingWindow(row)) {
+        consecutiveMissingWindows += 1;
+      } else {
+        if (isContaminatedMissingWindow(row)) {
+          contaminated = true;
+        }
+        break;
+      }
     }
+  } else {
+    // PASS_BY mode: do not escalate to strong missing from consecutive windows.
+    consecutiveMissingWindows = 0;
+    contaminated = isContaminatedMissingWindow(latest);
   }
 
   return {
     ...latest,
-    consecutive_missing_windows: consecutiveMissingWindows
+    consecutive_missing_windows: consecutiveMissingWindows,
+    fusion_mode: fusionMode,
+    contaminated_missing_window: contaminated
   };
 }
 
@@ -401,6 +494,7 @@ async function createEvidenceWindow({
         nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
       },
       scanner_window_evidence: finalFusion?.raw_json?.fallback_scanner_window || null,
+      fusion_mode: finalFusion?.raw_json?.fusion_mode || null,
       transition: {
         last_valid_scan_id: lastValidScan?.id ?? null,
         last_valid_scan_ts: lastValidScan?.created_at ?? null,
@@ -701,6 +795,7 @@ async function processSingleJob(job) {
     );
 
     const ai = aiRes.rows[0] || null;
+    const fusionMode = chooseFusionMode({ anprEvent: anpr, aiEvent: ai });
 
     let registryVehicle = null;
     let observedPubkeyHex = "";
@@ -782,7 +877,8 @@ async function processSingleJob(job) {
 
     const scannerWindowEvidence = await findScannerWindowEvidence({
       plate,
-      anchorTs: anpr.ts
+      anchorTs: anpr.ts,
+      fusionMode
     });
 
     const pass = await getOrCreateOpenPass({
@@ -802,6 +898,11 @@ async function processSingleJob(job) {
       allowMissingDecision: false,
       scannerWindowEvidence
     });
+
+    provisional.raw_json = {
+      ...(provisional.raw_json || {}),
+      fusion_mode: fusionMode
+    };
 
     await updatePassWithEvidence({
       pass,
@@ -823,10 +924,12 @@ async function processSingleJob(job) {
         registryVehicle,
         scanEventForFusion,
         scannerWindowEvidence,
+        fusionMode,
         provisional: {
           fusion_verdict: "MATCH",
           visual_confidence: provisional.visual_confidence || "NONE",
-          reasons: Array.isArray(provisional.reasons) ? provisional.reasons : []
+          reasons: Array.isArray(provisional.reasons) ? provisional.reasons : [],
+          raw_json: { fusion_mode: fusionMode }
         }
       });
     }
@@ -946,7 +1049,8 @@ async function updatePassWithEvidence({ pass, anpr, ai, scan, registryVehicle, p
     latest_anpr_id: anpr?.id ?? null,
     latest_ai_id: ai?.id ?? null,
     latest_scan_id: scan?.id ?? null,
-    registry_vehicle_id: registryVehicle?.id ?? null
+    registry_vehicle_id: registryVehicle?.id ?? null,
+    fusion_mode: provisional?.raw_json?.fusion_mode || null
   };
 
   await query(
@@ -998,7 +1102,8 @@ async function tryFinalisePass({
   registryVehicle,
   scanEventForFusion,
   provisional,
-  scannerWindowEvidence = null
+  scannerWindowEvidence = null,
+  fusionMode = "PASS_BY"
 }) {
   const res = await query(`SELECT * FROM fusion_passes WHERE id = $1 LIMIT 1`, [passId]);
   const pass = res.rows[0];
@@ -1035,6 +1140,10 @@ async function tryFinalisePass({
       allowMissingDecision: false,
       scannerWindowEvidence
     });
+    finalFusion.raw_json = {
+      ...(finalFusion.raw_json || {}),
+      fusion_mode: fusionMode
+    };
   } else if (
     hasStrongSuspicion &&
     passAge !== null &&
@@ -1050,7 +1159,9 @@ async function tryFinalisePass({
       plate: pass.plate,
       has_gotid: pass.has_gotid_expected,
       registry_status: pass.registry_status,
-      raw_json: {}
+      raw_json: {
+        fusion_mode: fusionMode
+      }
     };
   } else if (
     isMissingCandidate &&
@@ -1063,7 +1174,8 @@ async function tryFinalisePass({
       scannerWindowEvidence ||
       await findScannerWindowEvidence({
         plate: pass.plate,
-        anchorTs: latestAnpr?.ts || pass.last_seen_at || pass.first_seen_at
+        anchorTs: latestAnpr?.ts || pass.last_seen_at || pass.first_seen_at,
+        fusionMode
       });
 
     finalFusion = decideFusion({
@@ -1075,6 +1187,11 @@ async function tryFinalisePass({
       allowMissingDecision: true,
       scannerWindowEvidence: fallbackScannerWindowEvidence
     });
+
+    finalFusion.raw_json = {
+      ...(finalFusion.raw_json || {}),
+      fusion_mode: fusionMode
+    };
   } else if (
     idleAge !== null &&
     idleAge >= PASS_IDLE_FINALISE_SEC &&
@@ -1089,6 +1206,10 @@ async function tryFinalisePass({
       allowMissingDecision: false,
       scannerWindowEvidence
     });
+    finalFusion.raw_json = {
+      ...(finalFusion.raw_json || {}),
+      fusion_mode: fusionMode
+    };
   }
 
   if (!finalFusion) return null;
@@ -1239,12 +1360,14 @@ async function finaliseMatureOpenPasses() {
       const anpr = anprRes.rows[0] || null;
       const ai = aiRes.rows[0] || null;
       const registryVehicle = regRes.rows[0] || null;
+      const fusionMode = chooseFusionMode({ anprEvent: anpr, aiEvent: ai });
 
       const scanEventForFusion = buildScanEventForFusion(scan, registryVehicle);
 
       const scannerWindowEvidence = await findScannerWindowEvidence({
         plate: pass.plate,
-        anchorTs: anpr?.ts || pass.last_seen_at || pass.first_seen_at
+        anchorTs: anpr?.ts || pass.last_seen_at || pass.first_seen_at,
+        fusionMode
       });
 
       await tryFinalisePass({
@@ -1255,10 +1378,12 @@ async function finaliseMatureOpenPasses() {
         registryVehicle,
         scanEventForFusion,
         scannerWindowEvidence,
+        fusionMode,
         provisional: {
           fusion_verdict: pass.final_fusion_verdict || "PENDING",
           visual_confidence: pass.visual_confidence || "NONE",
-          reasons: Array.isArray(pass.reasons) ? pass.reasons : []
+          reasons: Array.isArray(pass.reasons) ? pass.reasons : [],
+          raw_json: { fusion_mode: fusionMode }
         }
       });
     } catch (err) {
