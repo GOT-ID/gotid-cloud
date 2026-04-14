@@ -36,6 +36,10 @@ function asStr(v, maxLen, fallback = null) {
 function asObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
+function asFiniteNumber(v, fallback = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 function jsonSizeBytes(obj) {
   try {
     return Buffer.byteLength(JSON.stringify(obj), "utf8");
@@ -58,10 +62,7 @@ router.post("/", requireAuth, async (req, res) => {
 
   try {
     // ---- 0) Validate + normalise payload (production hygiene) ----
-    const raw = asObj(body.raw_json);
-    if (jsonSizeBytes(raw) > MAX_RAW_JSON_BYTES) {
-      return res.status(413).json({ ok: false, error: "raw_json too large" });
-    }
+    const rawIn = asObj(body.raw_json);
 
     const observedPlate = normPlate(asStr(body.plate, MAX_PLATE_LEN, "") || "");
     const uuid = asStr(body.uuid, MAX_UUID_LEN, null);
@@ -76,7 +77,6 @@ router.post("/", requireAuth, async (req, res) => {
 
     let scanner_result = scanner_result_in;
 
-    // If scanner did not provide a trustworthy final result, infer a safe local intake label.
     if (!scanner_result || scanner_result === "UNKNOWN") {
       if (tamper_flag) {
         scanner_result = "TAMPERED";
@@ -119,17 +119,53 @@ router.post("/", requireAuth, async (req, res) => {
     const model = asStr(body.model, 128, null);
     const colour = asStr(body.colour, 32, null);
 
-    // pubkey_hex can come from raw_json or top-level
     const observedPubkeyHex = normHex(
-      asStr(raw.pubkey_hex ?? body.pubkey_hex, 300, "") || ""
+      asStr(rawIn.pubkey_hex ?? body.pubkey_hex, 300, "") || ""
     );
 
     if (!isHexOrEmpty(observedPubkeyHex)) {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
-    // Identity is only truly present if we captured public-key identity proof
-    // AND the base signature was valid.
+    // ---- NEW: preserve scanner-side radio evidence inside raw_json ----
+    const ble_packets_seen =
+      body.ble_packets_seen === undefined || body.ble_packets_seen === null
+        ? null
+        : clampInt(body.ble_packets_seen, 0, 1_000_000, 0);
+
+    const ble_devices_seen =
+      body.ble_devices_seen === undefined || body.ble_devices_seen === null
+        ? null
+        : clampInt(body.ble_devices_seen, 0, 1_000_000, 0);
+
+    const companyid_hits_seen =
+      body.companyid_hits_seen === undefined || body.companyid_hits_seen === null
+        ? null
+        : clampInt(body.companyid_hits_seen, 0, 1_000_000, 0);
+
+    const gotid_candidates_seen =
+      body.gotid_candidates_seen === undefined || body.gotid_candidates_seen === null
+        ? null
+        : clampInt(body.gotid_candidates_seen, 0, 1_000_000, 0);
+
+    const raw = {
+      ...rawIn,
+      ble_packets_seen,
+      ble_devices_seen,
+      companyid_hits_seen,
+      gotid_candidates_seen,
+      scanner_result,
+      scanner_id,
+      officer_id,
+      observed_plate: observedPlate || null,
+      rssi,
+      est_distance_m
+    };
+
+    if (jsonSizeBytes(raw) > MAX_RAW_JSON_BYTES) {
+      return res.status(413).json({ ok: false, error: "raw_json too large" });
+    }
+
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
     // ---- 1) Insert scan_events (forensic record only) ----
@@ -205,8 +241,6 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
-    // Intake acknowledgement only.
-    // Final adjudication is performed later by the fusion adjudicator worker.
     res.json({
       ok: true,
       id: scanRow.id,
