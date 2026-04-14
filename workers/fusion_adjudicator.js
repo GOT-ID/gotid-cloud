@@ -12,7 +12,7 @@ const SUSPICION_STABILISE_SEC = 8;    // replay/relay/invalid/tamper stabilisati
 const MISSING_OBSERVATION_SEC = 5;    // must wait this long before UUID_MISSING finalises
 
 console.log("🚔 GOT-ID Fusion Worker Started...");
-console.log("🚨 WORKER VERSION: scanner_window_events missing-evidence build loaded");
+console.log("🚨 WORKER VERSION: scanner_window_events consecutive-missing build loaded");
 
 function normPlate(p) {
   return (p || "").toUpperCase().replace(/\s+/g, "");
@@ -225,7 +225,7 @@ async function findScannerWindowEvidence({ plate, anchorTs }) {
   const p = normPlate(plate);
   if (!p || !anchorTs) return null;
 
-  const res = await query(
+  const latestRes = await query(
     `
     SELECT *
     FROM scanner_window_events
@@ -242,7 +242,59 @@ async function findScannerWindowEvidence({ plate, anchorTs }) {
     [p, anchorTs]
   );
 
-  return res.rows[0] || null;
+  const latest = latestRes.rows[0] || null;
+  if (!latest) return null;
+
+  const windowsRes = await query(
+    `
+    SELECT *
+    FROM scanner_window_events
+    WHERE plate = $1
+      AND created_at <= $2::timestamptz
+      AND created_at >= ($2::timestamptz - INTERVAL '20 seconds')
+    ORDER BY created_at DESC
+    `,
+    [p, latest.created_at]
+  );
+
+  let consecutiveMissingWindows = 0;
+
+  for (const row of windowsRes.rows) {
+    const validUuidSeen = row.valid_uuid_seen === true;
+    const validSigSeen = row.valid_sig_seen === true;
+    const validChalSeen = row.valid_chal_seen === true;
+    const pkMatchSeen = row.pk_match_seen === true;
+
+    const blePacketsSeen = Number(row.ble_packets_seen || 0);
+    const bleDevicesSeen = Number(row.ble_devices_seen || 0);
+    const companyIdHits = Number(row.companyid_hits_seen || 0);
+    const gotidCandidates = Number(row.gotid_candidates_seen || 0);
+    const strongestRssi = row.strongest_rssi;
+
+    const scannerAlive =
+      blePacketsSeen > 0 ||
+      bleDevicesSeen > 0 ||
+      companyIdHits > 0 ||
+      gotidCandidates > 0 ||
+      strongestRssi !== null;
+
+    const noValidIdentity =
+      !validUuidSeen &&
+      !validSigSeen &&
+      !validChalSeen &&
+      !pkMatchSeen;
+
+    if (scannerAlive && noValidIdentity) {
+      consecutiveMissingWindows += 1;
+    } else {
+      break;
+    }
+  }
+
+  return {
+    ...latest,
+    consecutive_missing_windows: consecutiveMissingWindows
+  };
 }
 
 function shouldCreateEvidenceWindow(decisionType) {
