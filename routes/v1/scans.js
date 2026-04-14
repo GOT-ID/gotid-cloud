@@ -36,10 +36,6 @@ function asStr(v, maxLen, fallback = null) {
 function asObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
-function asFiniteNumber(v, fallback = null) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
 function jsonSizeBytes(obj) {
   try {
     return Buffer.byteLength(JSON.stringify(obj), "utf8");
@@ -54,6 +50,9 @@ const MAX_UUID_LEN = 128;
 const MAX_PLATE_LEN = 16;
 const MAX_SCANNER_ID_LEN = 64;
 const MAX_OFFICER_ID_LEN = 64;
+
+/* ---------- scanner window config ---------- */
+const SCANNER_WINDOW_SEC = 10;
 
 const router = Router();
 
@@ -118,6 +117,7 @@ router.post("/", requireAuth, async (req, res) => {
     const make = asStr(body.make, 64, null);
     const model = asStr(body.model, 128, null);
     const colour = asStr(body.colour, 32, null);
+    const camera_id = asStr(body.camera_id, 64, null);
 
     const observedPubkeyHex = normHex(
       asStr(rawIn.pubkey_hex ?? body.pubkey_hex, 300, "") || ""
@@ -127,7 +127,7 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
-    // ---- NEW: preserve scanner-side radio evidence inside raw_json ----
+    // ---- radio evidence preserved in raw_json and also used for scanner_window_events ----
     const ble_packets_seen =
       body.ble_packets_seen === undefined || body.ble_packets_seen === null
         ? null
@@ -148,15 +148,40 @@ router.post("/", requireAuth, async (req, res) => {
         ? null
         : clampInt(body.gotid_candidates_seen, 0, 1_000_000, 0);
 
+    const valid_uuid_seen =
+      body.valid_uuid_seen === undefined || body.valid_uuid_seen === null
+        ? !!uuid
+        : asBool(body.valid_uuid_seen, false);
+
+    const valid_sig_seen =
+      body.valid_sig_seen === undefined || body.valid_sig_seen === null
+        ? sig_valid === true
+        : asBool(body.valid_sig_seen, false);
+
+    const valid_chal_seen =
+      body.valid_chal_seen === undefined || body.valid_chal_seen === null
+        ? chal_valid === true
+        : asBool(body.valid_chal_seen, false);
+
+    const pk_match_seen =
+      body.pk_match_seen === undefined || body.pk_match_seen === null
+        ? false
+        : asBool(body.pk_match_seen, false);
+
     const raw = {
       ...rawIn,
       ble_packets_seen,
       ble_devices_seen,
       companyid_hits_seen,
       gotid_candidates_seen,
+      valid_uuid_seen,
+      valid_sig_seen,
+      valid_chal_seen,
+      pk_match_seen,
       scanner_result,
       scanner_id,
       officer_id,
+      camera_id,
       observed_plate: observedPlate || null,
       rssi,
       est_distance_m
@@ -168,7 +193,7 @@ router.post("/", requireAuth, async (req, res) => {
 
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
-    // ---- 1) Insert scan_events (forensic record only) ----
+    // ---- 1) Insert scan_events (forensic record) ----
     const insertSql = `
       INSERT INTO scan_events (
         ver,
@@ -240,6 +265,96 @@ router.post("/", requireAuth, async (req, res) => {
 
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
+
+    // ---- 2) Insert live scanner_window_events fallback evidence ----
+    // This is the immediate professional bridge so the fusion worker has real,
+    // time-local scanner environment evidence for UUID_MISSING decisions.
+    const scannerWindowSql = `
+      INSERT INTO scanner_window_events (
+        plate,
+        camera_id,
+        scanner_id,
+        window_start,
+        window_end,
+        ble_packets_seen,
+        ble_devices_seen,
+        companyid_hits_seen,
+        gotid_candidates_seen,
+        strongest_rssi,
+        nearest_est_distance_m,
+        valid_uuid_seen,
+        valid_sig_seen,
+        valid_chal_seen,
+        pk_match_seen,
+        raw_json
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4::timestamptz,
+        $5::timestamptz,
+        $6,
+        $7,
+        $8,
+        $9,
+        $10,
+        $11,
+        $12,
+        $13,
+        $14,
+        $15,
+        $16::jsonb
+      )
+      RETURNING id;
+    `;
+
+    const scannerWindowParams = [
+      observedPlate || null,
+      camera_id,
+      scanner_id,
+      new Date(new Date(scanRow.created_at).getTime() - (SCANNER_WINDOW_SEC / 2) * 1000).toISOString(),
+      new Date(new Date(scanRow.created_at).getTime() + (SCANNER_WINDOW_SEC / 2) * 1000).toISOString(),
+      ble_packets_seen,
+      ble_devices_seen,
+      companyid_hits_seen,
+      gotid_candidates_seen,
+      rssi,
+      est_distance_m,
+      valid_uuid_seen,
+      valid_sig_seen,
+      valid_chal_seen,
+      pk_match_seen,
+      JSON.stringify({
+        source: "routes/v1/scans.js",
+        scan_event_id: scanRow.id,
+        scanner_result,
+        has_identity,
+        observed_plate: observedPlate || null,
+        uuid: uuid || null,
+        counter,
+        scanner_id,
+        camera_id,
+        ble_packets_seen,
+        ble_devices_seen,
+        companyid_hits_seen,
+        gotid_candidates_seen,
+        strongest_rssi: rssi,
+        nearest_est_distance_m: est_distance_m,
+        valid_uuid_seen,
+        valid_sig_seen,
+        valid_chal_seen,
+        pk_match_seen
+      })
+    ];
+
+    try {
+      await query(scannerWindowSql, scannerWindowParams);
+    } catch (windowErr) {
+      console.error("scanner_window_events insert error:", windowErr);
+      // Do not fail the scan ingest if the fallback evidence insert fails.
+      // scan_events is still the primary forensic record.
+    }
 
     res.json({
       ok: true,
