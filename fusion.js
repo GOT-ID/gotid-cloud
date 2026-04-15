@@ -266,6 +266,19 @@ function detectRecentIdentityLossRecovery(scanEvent, scannerWindowEvidence) {
   };
 }
 
+function isEnrolledMissingTagState(fused) {
+  const rs = normStr(fused?.registry_status);
+
+  return (
+    fused?.has_gotid === true &&
+    (
+      rs === "ENROLLED_NO_VALID_TAG_SEEN" ||
+      rs === "ENROLLED" ||
+      rs === "ACTIVE"
+    )
+  );
+}
+
 export function decideFusion({
   registryVehicle,
   scanEvent,
@@ -573,6 +586,18 @@ export function decideFusion({
     fused.final_label = "PENDING";
   } else if (v === "MATCH_CRYPTO_ONLY") {
     fused.final_label = "MATCH_CRYPTO_ONLY";
+  } else if (v === "UUID_MISSING" && isEnrolledMissingTagState(fused)) {
+    const missingGrade = fused.raw_json?.missing_evidence_grade || "NONE";
+
+    if (missingGrade === "VERY_STRONG") {
+      fused.final_label = "UUID_MISSING_SUSPECT_CLONE_VERY_STRONG";
+    } else if (missingGrade === "STRONG") {
+      fused.final_label = "UUID_MISSING_SUSPECT_CLONE_STRONG";
+    } else if (missingGrade === "USABLE") {
+      fused.final_label = "UUID_MISSING_SUSPECT_CLONE";
+    } else {
+      fused.final_label = "UUID_MISSING_SUSPECT_CLONE";
+    }
   } else if (v === "UUID_MISSING" && fused.has_gotid === true) {
     const missingGrade = fused.raw_json?.missing_evidence_grade || "NONE";
 
