@@ -1,8 +1,37 @@
 // fusion.js
-// GOT-ID fusion engine: crypto is the truth, cameras support it (never override crypto).
+// GOT-ID fusion engine
+// Police-grade principle:
+// - Crypto is the truth.
+// - Cameras support identity context, never override valid crypto.
+// - Clean absence windows can prove UUID_MISSING.
+// - If identity disappears and later returns, preserve that as a recovery-after-absence story.
 
 function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function toMs(ts) {
+  if (!ts) return null;
+  const t = new Date(ts).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function boolish(v) {
+  return v === true || v === "true" || v === 1 || v === "1";
+}
+
+function toInt(v, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+
+function normStr(s) {
+  return (s || "").toString().trim().toUpperCase();
+}
+
+function pushReason(arr, msg) {
+  if (!Array.isArray(arr)) return;
+  if (!arr.includes(msg)) arr.push(msg);
 }
 
 // confidence may be stored as a column OR inside raw_json.confidence
@@ -16,10 +45,6 @@ function getConfidence(ev) {
   if (c2 !== null) return c2;
 
   return null;
-}
-
-function normStr(s) {
-  return (s || "").toString().trim().toUpperCase();
 }
 
 function getAiVehicleType(aiEvent) {
@@ -50,15 +75,9 @@ function deriveRegistryVehicleType(registryVehicle) {
     text.includes("LORRY")
   ) return "TRUCK";
 
-  if (
-    text.includes("BUS") ||
-    text.includes("COACH")
-  ) return "BUS";
+  if (text.includes("BUS") || text.includes("COACH")) return "BUS";
 
-  if (
-    text.includes("VAN") ||
-    text.includes("TRANSIT")
-  ) return "VAN";
+  if (text.includes("VAN") || text.includes("TRANSIT")) return "VAN";
 
   if (
     text.includes("HATCHBACK") ||
@@ -98,27 +117,6 @@ function vehicleTypeMatches(aiType, regType) {
   return false;
 }
 
-// Helper: parse event timestamps safely (ms since epoch)
-function toMs(ts) {
-  if (!ts) return null;
-  const t = new Date(ts).getTime();
-  return Number.isFinite(t) ? t : null;
-}
-
-function boolish(v) {
-  return v === true || v === "true" || v === 1 || v === "1";
-}
-
-function toInt(v, d = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-
-function pushReason(arr, msg) {
-  if (!Array.isArray(arr)) return;
-  if (!arr.includes(msg)) arr.push(msg);
-}
-
 function buildFallbackScannerWindow(scannerWindowEvidence) {
   if (!scannerWindowEvidence) return null;
 
@@ -147,9 +145,12 @@ function evaluateScannerWindowEvidence(ev) {
   if (!ev) {
     return {
       usable: false,
+      cleanAbsence: false,
       strong: false,
       veryStrong: false,
       consecutiveMissingWindows: 0,
+      scannerAlive: false,
+      noValidIdentity: false,
       reasons: ["No fallback scanner evidence window found."]
     };
   }
@@ -181,16 +182,15 @@ function evaluateScannerWindowEvidence(ev) {
     !validChalSeen &&
     !pkMatchSeen;
 
+  const cleanAbsence = scannerAlive && noValidIdentity;
   const usable = scannerAlive;
 
   const strong =
-    scannerAlive &&
-    noValidIdentity &&
+    cleanAbsence &&
     consecutiveMissingWindows >= 2;
 
   const veryStrong =
-    scannerAlive &&
-    noValidIdentity &&
+    cleanAbsence &&
     consecutiveMissingWindows >= 3;
 
   const reasons = [];
@@ -211,7 +211,59 @@ function evaluateScannerWindowEvidence(ev) {
 
   reasons.push(`Consecutive clean missing windows observed: ${consecutiveMissingWindows}`);
 
-  return { usable, strong, veryStrong, consecutiveMissingWindows, reasons };
+  return {
+    usable,
+    cleanAbsence,
+    strong,
+    veryStrong,
+    consecutiveMissingWindows,
+    scannerAlive,
+    noValidIdentity,
+    reasons
+  };
+}
+
+function detectRecentIdentityLossRecovery(scanEvent, scannerWindowEvidence) {
+  if (!scanEvent || !scannerWindowEvidence) {
+    return {
+      recoveredAfterAbsence: false,
+      secondsGap: null
+    };
+  }
+
+  const evEval = evaluateScannerWindowEvidence(scannerWindowEvidence);
+
+  if (!evEval.cleanAbsence) {
+    return {
+      recoveredAfterAbsence: false,
+      secondsGap: null
+    };
+  }
+
+  const scanTs = toMs(scanEvent.created_at || scanEvent.ts);
+  const winEndTs = toMs(scannerWindowEvidence.window_end);
+
+  if (scanTs === null || winEndTs === null) {
+    return {
+      recoveredAfterAbsence: false,
+      secondsGap: null
+    };
+  }
+
+  const gapS = Math.round((scanTs - winEndTs) / 1000);
+
+  // Police-grade rule:
+  // if a clean absence window ends shortly before a valid crypto return,
+  // preserve that as a recovered-after-absence encounter.
+  const recoveredAfterAbsence =
+    gapS >= 0 &&
+    gapS <= 30 &&
+    evEval.consecutiveMissingWindows >= 1;
+
+  return {
+    recoveredAfterAbsence,
+    secondsGap: gapS
+  };
 }
 
 export function decideFusion({
@@ -259,39 +311,60 @@ export function decideFusion({
     raw_json: {}
   };
 
+  const windowEval = evaluateScannerWindowEvidence(scannerWindowEvidence);
+  const fallbackScannerWindow = buildFallbackScannerWindow(scannerWindowEvidence);
+  const recoveryEval = detectRecentIdentityLossRecovery(scanEvent, scannerWindowEvidence);
+
+  fused.raw_json = {
+    ...(fused.raw_json || {}),
+    fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
+    fallback_scanner_window: fallbackScannerWindow,
+    scanner_window_summary: {
+      usable: windowEval.usable,
+      clean_absence: windowEval.cleanAbsence,
+      strong: windowEval.strong,
+      very_strong: windowEval.veryStrong,
+      consecutive_missing_windows: windowEval.consecutiveMissingWindows
+    },
+    recovery_summary: {
+      recovered_after_absence: recoveryEval.recoveredAfterAbsence,
+      gap_seconds_from_absence_window_end: recoveryEval.secondsGap
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // 1) Preserve strongest scanner/cloud truth first
   // ---------------------------------------------------------------------------
   if (scannerResult === "CLONE_SUSPECT" || cloudVerdict === "KEY_MISMATCH") {
     fused.fusion_verdict = "MISMATCH_PUBKEY";
-    fused.reasons.push("Scanner/cloud detected pubkey mismatch or clone suspicion.");
+    pushReason(fused.reasons, "Scanner/cloud detected pubkey mismatch or clone suspicion.");
   } else if (scannerResult === "REPLAY_SUSPECT") {
     fused.fusion_verdict = "REPLAY_SUSPECT";
-    fused.reasons.push("Scanner detected replay or counter rollback suspicion.");
+    pushReason(fused.reasons, "Scanner detected replay or counter rollback suspicion.");
   } else if (scannerResult === "INVALID_TAG") {
     fused.fusion_verdict = "INVALID_TAG";
-    fused.reasons.push("Scanner detected invalid base signature.");
+    pushReason(fused.reasons, "Scanner detected invalid base signature.");
   } else if (scannerResult === "RELAY_SUSPECT") {
     fused.fusion_verdict = "RELAY_SUSPECT";
-    fused.reasons.push("Scanner challenge-response failed; relay suspected.");
+    pushReason(fused.reasons, "Scanner challenge-response failed; relay suspected.");
   } else if (scannerResult === "TAMPERED") {
     fused.fusion_verdict = "TAMPER";
-    fused.reasons.push("Scanner detected active tamper condition.");
+    pushReason(fused.reasons, "Scanner detected active tamper condition.");
   } else if (cloudVerdict === "MISMATCH") {
     fused.fusion_verdict = "MISMATCH";
-    fused.reasons.push("Cloud detected plate mismatch.");
+    pushReason(fused.reasons, "Cloud detected plate mismatch.");
   } else if (cloudVerdict === "REPLAY_SUSPECT") {
     fused.fusion_verdict = "REPLAY_SUSPECT";
-    fused.reasons.push("Cloud classified scan as replay suspicion.");
+    pushReason(fused.reasons, "Cloud classified scan as replay suspicion.");
   } else if (cloudVerdict === "INVALID_TAG") {
     fused.fusion_verdict = "INVALID_TAG";
-    fused.reasons.push("Cloud classified scan as invalid tag.");
+    pushReason(fused.reasons, "Cloud classified scan as invalid tag.");
   } else if (cloudVerdict === "RELAY_SUSPECT") {
     fused.fusion_verdict = "RELAY_SUSPECT";
-    fused.reasons.push("Cloud classified scan as relay suspicion.");
+    pushReason(fused.reasons, "Cloud classified scan as relay suspicion.");
   } else if (cloudVerdict === "TAMPERED") {
     fused.fusion_verdict = "TAMPER";
-    fused.reasons.push("Cloud classified scan as tampered.");
+    pushReason(fused.reasons, "Cloud classified scan as tampered.");
   }
 
   // ---------------------------------------------------------------------------
@@ -300,68 +373,52 @@ export function decideFusion({
   if (!fused.fusion_verdict) {
     if (!registryVehicle) {
       fused.fusion_verdict = "NOT_ENROLLED";
-      fused.reasons.push("Vehicle not found in registry for this scan context.");
+      pushReason(fused.reasons, "Vehicle not found in registry for this scan context.");
     } else if (fused.has_gotid === false) {
       if (!scanEvent) {
         fused.fusion_verdict = "NOT_ENROLLED";
-        fused.reasons.push("Vehicle does not have GOT-ID assigned.");
+        pushReason(fused.reasons, "Vehicle does not have GOT-ID assigned.");
       } else {
         fused.fusion_verdict = "UNKNOWN_TAG";
-        fused.reasons.push("GOT-ID tag detected but vehicle is not enrolled for GOT-ID.");
+        pushReason(fused.reasons, "GOT-ID tag detected but vehicle is not enrolled for GOT-ID.");
       }
     } else {
+      // -----------------------------------------------------------------------
+      // TRUE UUID_MISSING path
+      // -----------------------------------------------------------------------
       if (!scanEvent || !hasIdentity) {
         if (allowMissingDecision === true) {
-          const evEval = evaluateScannerWindowEvidence(scannerWindowEvidence);
-          const fallbackScannerWindow = buildFallbackScannerWindow(scannerWindowEvidence);
-
           pushReason(fused.reasons, "Enrolled vehicle but no GOT-ID identity was captured within scan window.");
 
-          for (const r of evEval.reasons) {
+          for (const r of windowEval.reasons) {
             pushReason(fused.reasons, r);
           }
 
-          if (evEval.veryStrong) {
+          if (windowEval.veryStrong) {
             fused.fusion_verdict = "UUID_MISSING";
             fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
-            fused.raw_json = {
-              ...(fused.raw_json || {}),
-              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              fallback_scanner_window: fallbackScannerWindow,
-              missing_evidence_grade: "VERY_STRONG"
-            };
-          } else if (evEval.strong) {
+            fused.raw_json.missing_evidence_grade = "VERY_STRONG";
+          } else if (windowEval.strong) {
             fused.fusion_verdict = "UUID_MISSING";
             fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
-            fused.raw_json = {
-              ...(fused.raw_json || {}),
-              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              fallback_scanner_window: fallbackScannerWindow,
-              missing_evidence_grade: "STRONG"
-            };
-          } else if (evEval.usable) {
+            fused.raw_json.missing_evidence_grade = "STRONG";
+          } else if (windowEval.usable && windowEval.cleanAbsence) {
             fused.fusion_verdict = "UUID_MISSING";
             fused.registry_status = "ENROLLED_NO_VALID_TAG_SEEN";
-            fused.raw_json = {
-              ...(fused.raw_json || {}),
-              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              fallback_scanner_window: fallbackScannerWindow,
-              missing_evidence_grade: "USABLE"
-            };
+            fused.raw_json.missing_evidence_grade = "USABLE";
           } else {
             fused.fusion_verdict = "NO_SCANNER_EVIDENCE";
             fused.registry_status = "INSUFFICIENT_SCANNER_EVIDENCE";
-            fused.raw_json = {
-              ...(fused.raw_json || {}),
-              fallback_scanner_window_event_id: scannerWindowEvidence?.id || null,
-              missing_evidence_grade: "NONE"
-            };
+            fused.raw_json.missing_evidence_grade = "NONE";
           }
         } else {
           fused.fusion_verdict = "PENDING";
-          fused.reasons.push("Enrolled vehicle pass is still awaiting identity evidence before deadline.");
+          pushReason(fused.reasons, "Enrolled vehicle pass is still awaiting identity evidence before deadline.");
         }
       } else {
+        // ---------------------------------------------------------------------
+        // Counter / replay policy
+        // ---------------------------------------------------------------------
         const DUP_WINDOW_S = 35;
         const REPLAY_WINDOW_S = 120;
 
@@ -373,7 +430,7 @@ export function decideFusion({
         if (typeof prevCounter === "number" && typeof scanEvent.counter === "number") {
           if (scanEvent.counter < prevCounter) {
             fused.fusion_verdict = "COUNTER_ROLLBACK";
-            fused.reasons.push("Counter rolled back vs previous scan (strong clone/reset signal).");
+            pushReason(fused.reasons, "Counter rolled back vs previous scan (strong clone/reset signal).");
           } else if (scanEvent.counter === prevCounter) {
             const currentTs = toMs(scanEvent.created_at) || toMs(scanEvent.ts) || null;
             const previousTs = toMs(prevTs);
@@ -383,52 +440,61 @@ export function decideFusion({
                 : null;
 
             if (gapS !== null && gapS <= DUP_WINDOW_S) {
-              fused.reasons.push(
-                `Same counter re-seen after ${Math.round(gapS)}s (benign duplicate live sighting).`
-              );
+              pushReason(fused.reasons, `Same counter re-seen after ${Math.round(gapS)}s (benign duplicate live sighting).`);
             } else if (gapS !== null && gapS > REPLAY_WINDOW_S) {
               fused.fusion_verdict = "REPLAY_SUSPECT";
-              fused.reasons.push(
-                `Counter repeated after ${Math.round(gapS)}s since previous scan (possible replay).`
-              );
+              pushReason(fused.reasons, `Counter repeated after ${Math.round(gapS)}s since previous scan (possible replay).`);
             } else {
-              fused.reasons.push(
-                `Same counter repeated after ${Math.round(gapS)}s (still treated as live duplicate, broadcaster rotates every ~30s).`
-              );
+              pushReason(fused.reasons, `Same counter repeated after ${Math.round(gapS)}s (still treated as live duplicate, broadcaster rotates every ~30s).`);
             }
           }
         }
 
+        // ---------------------------------------------------------------------
+        // Core crypto truth
+        // ---------------------------------------------------------------------
         if (!fused.fusion_verdict) {
           if (scanEvent.sig_valid === false) {
             fused.fusion_verdict = "INVALID_TAG";
-            fused.reasons.push("Base signature verification failed.");
+            pushReason(fused.reasons, "Base signature verification failed.");
           } else if (scanEvent.chal_valid === false) {
             fused.fusion_verdict = "RELAY_SUSPECT";
-            fused.reasons.push("Challenge-response failed.");
+            pushReason(fused.reasons, "Challenge-response failed.");
           } else if (scanEvent.pubkey_match === false) {
             fused.fusion_verdict = "MISMATCH_PUBKEY";
-            fused.reasons.push("GOT-ID tag pubkey does not match registry.");
+            pushReason(fused.reasons, "GOT-ID tag pubkey does not match registry.");
           } else if (scanEvent.tamper === true) {
             fused.fusion_verdict = "TAMPER";
-            fused.reasons.push("GOT-ID tag tamper input is active.");
+            pushReason(fused.reasons, "GOT-ID tag tamper input is active.");
           } else if (
             scanEvent.sig_valid === true &&
             scanEvent.pubkey_match === true &&
             scanEvent.chal_valid === true
           ) {
             fused.fusion_verdict = "MATCH";
-            fused.reasons.push("All cryptographic checks passed, pubkey matches registry, and live challenge-response succeeded.");
+            pushReason(fused.reasons, "All cryptographic checks passed, pubkey matches registry, and live challenge-response succeeded.");
+
+            // Police-grade truth preservation:
+            // if clean absence was seen shortly before a later clean return,
+            // preserve that story explicitly instead of hiding it.
+            if (recoveryEval.recoveredAfterAbsence) {
+              pushReason(
+                fused.reasons,
+                `Valid identity returned ${recoveryEval.secondsGap}s after a clean no-identity interval.`
+              );
+              fused.raw_json.identity_recovery_after_absence = true;
+              fused.raw_json.identity_recovery_gap_seconds = recoveryEval.secondsGap;
+            }
           } else if (
             scanEvent.sig_valid === true &&
             scanEvent.pubkey_match === true &&
             scanEvent.chal_valid !== false
           ) {
             fused.fusion_verdict = "MATCH_CRYPTO_ONLY";
-            fused.reasons.push("Cryptographic identity passed and pubkey matches registry, but live challenge was not confirmed.");
+            pushReason(fused.reasons, "Cryptographic identity passed and pubkey matches registry, but live challenge was not confirmed.");
           } else {
             fused.fusion_verdict = "UNKNOWN_TAG";
-            fused.reasons.push("Identity evidence was present but insufficient to classify as a trusted match.");
+            pushReason(fused.reasons, "Identity evidence was present but insufficient to classify as a trusted match.");
           }
         }
       }
@@ -455,7 +521,7 @@ export function decideFusion({
 
     if (registryVehicle) {
       const aiMake = normStr(aiEvent.make || aiEvent.raw_json?.make);
-      const aiColour = normStr(aiEvent.colour || aiEvent.raw_json?.colour_estimate);
+      const aiColour = normStr(aiEvent.colour || aiEvent.raw_json?.colour_estimate || aiEvent.raw_json?.vehicle_colour);
       const aiType = getAiVehicleType(aiEvent);
 
       const regMake = normStr(registryVehicle.make);
@@ -471,7 +537,7 @@ export function decideFusion({
       }
 
       if (typeMatches) {
-        fused.reasons.push(`AI vehicle type matches registry (${aiType}).`);
+        pushReason(fused.reasons, `AI vehicle type matches registry (${aiType}).`);
       }
 
       if (
@@ -479,7 +545,7 @@ export function decideFusion({
         (aiColour && regColour && aiColour !== regColour) ||
         (aiType && regType && !typeMatches)
       ) {
-        fused.reasons.push("AI appearance does not fully match registry (type/make/colour).");
+        pushReason(fused.reasons, "AI appearance does not fully match registry (type/make/colour).");
       }
     }
   }
@@ -495,10 +561,14 @@ export function decideFusion({
   const v = fused.fusion_verdict;
 
   if (v === "MATCH") {
-    fused.final_label =
-      fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
-        ? "MATCH_STRONG"
-        : "MATCH_WEAK_VISUAL";
+    if (fused.raw_json?.identity_recovery_after_absence === true) {
+      fused.final_label = "MATCH_AFTER_IDENTITY_RECOVERY";
+    } else {
+      fused.final_label =
+        fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
+          ? "MATCH_STRONG"
+          : "MATCH_WEAK_VISUAL";
+    }
   } else if (v === "PENDING") {
     fused.final_label = "PENDING";
   } else if (v === "MATCH_CRYPTO_ONLY") {
@@ -530,6 +600,10 @@ export function decideFusion({
       fused.visual_confidence === "STRONG" || fused.visual_confidence === "MEDIUM"
         ? "TAMPER_STRONG"
         : "TAMPER_WEAK";
+  } else if (v === "NOT_ENROLLED") {
+    fused.final_label = "NOT_ENROLLED";
+  } else if (v === "UNKNOWN_TAG") {
+    fused.final_label = "UNKNOWN_TAG";
   } else {
     fused.final_label = v || "UNKNOWN";
   }
