@@ -10,6 +10,7 @@ import authRoute from "./routes/v1/auth.js";
 import anprRoute from "./routes/v1/anpr.js";
 import aiRoute from "./routes/v1/ai.js";
 import fusionRoute from "./routes/v1/fusion.js";
+import scannerWindowsRoute from "./routes/v1/scanner_windows.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
@@ -61,7 +62,8 @@ app.get("/", (req, res) => {
       ai: "/v1/ai",
       fusion: "/v1/fusion",
       fusion_recent: "/v1/fusion/recent",
-    },
+      scanner_windows: "/v1/scanner-windows"
+    }
   });
 });
 
@@ -74,6 +76,7 @@ app.use("/v1/auth", authRoute);
 app.use("/v1/anpr", anprRoute);
 app.use("/v1/ai", aiRoute);
 app.use("/v1/fusion", fusionRoute);
+app.use("/v1/scanner-windows", scannerWindowsRoute);
 
 // ----------------------------------------------
 // 404 FALLBACK
