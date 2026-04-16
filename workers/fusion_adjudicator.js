@@ -320,6 +320,25 @@ async function getEncounterWindows({ plate, anchorTs }) {
   return res.rows;
 }
 
+async function getNearbyScannerWindowsAnyPlate({ anchorTs }) {
+  if (!anchorTs) return [];
+
+  const res = await query(
+    `
+    SELECT *
+    FROM scanner_window_events
+    WHERE created_at BETWEEN ($1::timestamptz - INTERVAL '20 seconds')
+                         AND ($1::timestamptz + INTERVAL '20 seconds')
+    ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $1::timestamptz))) ASC,
+             created_at ASC
+    LIMIT 20
+    `,
+    [anchorTs]
+  );
+
+  return res.rows;
+}
+
 async function getEncounterScans({ plate, anchorTs }) {
   const p = normPlate(plate);
   if (!p || !anchorTs) return [];
@@ -388,14 +407,19 @@ function summariseEncounter({
   windows,
   scans,
   anprEvent,
-  aiEvent
+  aiEvent,
+  nearbyWindows = []
 }) {
   const encounterProfile = classifyEncounterProfile({ anprEvent, aiEvent });
 
-  const scannerCoveragePresent = windows.some(hasScannerCoverage);
+  const effectiveWindows = (Array.isArray(windows) && windows.length)
+    ? windows
+    : (Array.isArray(nearbyWindows) ? nearbyWindows : []);
 
-  const identitySeenInWindows = windows.some(windowShowsIdentity);
-  const relaySeenInWindows = windows.some(windowShowsRelay);
+  const scannerCoveragePresent = effectiveWindows.some(hasScannerCoverage);
+
+  const identitySeenInWindows = effectiveWindows.some(windowShowsIdentity);
+  const relaySeenInWindows = effectiveWindows.some(windowShowsRelay);
 
   const identitySeenInScans = scans.some((s) => {
     const sig = asBool(s.sig_valid, false);
@@ -413,11 +437,11 @@ function summariseEncounter({
 
   let consecutiveCleanAbsenceWindows = 0;
   let contaminatedWindows = 0;
-  let latestRelevantWindow = windows.length ? windows[windows.length - 1] : null;
+  let latestRelevantWindow = effectiveWindows.length ? effectiveWindows[effectiveWindows.length - 1] : null;
   let latestCleanAbsenceWindow = null;
 
-  for (let i = windows.length - 1; i >= 0; i--) {
-    const row = windows[i];
+  for (let i = effectiveWindows.length - 1; i >= 0; i--) {
+    const row = effectiveWindows[i];
 
     if (isCleanAbsenceWindow(row)) {
       consecutiveCleanAbsenceWindows += 1;
@@ -437,6 +461,10 @@ function summariseEncounter({
   return {
     encounter_profile: encounterProfile,
     scanner_coverage_present: scannerCoveragePresent,
+    scanner_window_source:
+      Array.isArray(windows) && windows.length
+        ? "PLATE_LINKED"
+        : (Array.isArray(nearbyWindows) && nearbyWindows.length ? "TIME_CORRELATED_SUPPORT" : "NONE"),
     identity_present_any:
       identitySeenInWindows || identitySeenInScans,
     valid_match_present_any: validMatchSeenInScans,
@@ -444,7 +472,9 @@ function summariseEncounter({
       relaySeenInWindows || relaySeenInScans,
     consecutive_clean_absence_windows: consecutiveCleanAbsenceWindows,
     contaminated_windows: contaminatedWindows,
-    window_count: windows.length,
+    window_count: effectiveWindows.length,
+    plate_window_count: Array.isArray(windows) ? windows.length : 0,
+    nearby_window_count: Array.isArray(nearbyWindows) ? nearbyWindows.length : 0,
     scan_count: scans.length,
     latest_relevant_window: latestRelevantWindow,
     latest_clean_absence_window: latestCleanAbsenceWindow
@@ -557,6 +587,7 @@ async function createEvidenceWindow({
         nearest_est_distance_m: latestScan?.est_distance_m ?? latestScan?.raw_json?.est_distance_m ?? null
       },
       scanner_window_evidence: finalFusion?.raw_json?.fallback_scanner_window || null,
+      scanner_window_source: finalFusion?.raw_json?.encounter_summary?.scanner_window_source || null,
       transition: {
         last_valid_scan_id: lastValidScan?.id ?? null,
         last_valid_scan_ts: lastValidScan?.created_at ?? null,
@@ -783,20 +814,37 @@ async function enrichSingleEvidenceWindow(ew) {
 async function buildEncounterPolicyContext({ plate, anchorTs, anprEvent, aiEvent }) {
   const windows = await getEncounterWindows({ plate, anchorTs });
   const scans = await getEncounterScans({ plate, anchorTs });
+  const nearbyWindows = windows.length ? [] : await getNearbyScannerWindowsAnyPlate({ anchorTs });
 
   return summariseEncounter({
     windows,
     scans,
     anprEvent,
-    aiEvent
+    aiEvent,
+    nearbyWindows
   });
 }
 
 function attachEncounterSummary(finalFusion, encounterSummary) {
+  const latestRelevantWindow = encounterSummary?.latest_relevant_window || null;
+
   finalFusion.raw_json = {
     ...(finalFusion.raw_json || {}),
-    encounter_summary: encounterSummary
+    encounter_summary: encounterSummary || null,
+    fallback_scanner_window_event_id:
+      finalFusion?.raw_json?.fallback_scanner_window_event_id ||
+      latestRelevantWindow?.id ||
+      null,
+    fallback_scanner_window:
+      finalFusion?.raw_json?.fallback_scanner_window ||
+      (latestRelevantWindow
+        ? buildFallbackWindowForFusion(
+            latestRelevantWindow,
+            encounterSummary?.consecutive_clean_absence_windows || 0
+          )
+        : null)
   };
+
   return finalFusion;
 }
 
