@@ -35,6 +35,11 @@ function asObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
 
+function asNullablePlate(v) {
+  const p = normPlate(asStr(v, 16, "") || "");
+  return p || null;
+}
+
 const router = Router();
 
 router.post("/", requireAuth, async (req, res) => {
@@ -44,7 +49,7 @@ router.post("/", requireAuth, async (req, res) => {
 
     const scanner_id = asStr(body.scanner_id, 64, "SCN-001");
     const camera_id = asStr(body.camera_id, 64, null);
-    const plate = normPlate(asStr(body.plate, 16, "") || "");
+    const plate = asNullablePlate(body.plate);
 
     const window_start = body.window_start || null;
     const window_end = body.window_end || null;
@@ -76,12 +81,36 @@ router.post("/", requireAuth, async (req, res) => {
     const valid_chal_seen = asBool(body.valid_chal_seen, false);
     const pk_match_seen = asBool(body.pk_match_seen, false);
 
+    // New police-grade plate association fields
+    const plate_association = asStr(body.plate_association, 32, null);
+    const plate_hint_age_ms =
+      body.plate_hint_age_ms === undefined || body.plate_hint_age_ms === null
+        ? null
+        : clampInt(body.plate_hint_age_ms, 0, 86_400_000, 0);
+
+    const anpr_plate_hint = asNullablePlate(
+      body.anpr_plate_hint ?? rawIn.anpr_plate_hint
+    );
+
+    const anpr_plate_fresh =
+      body.anpr_plate_fresh === undefined || body.anpr_plate_fresh === null
+        ? (
+            rawIn.anpr_plate_fresh === undefined || rawIn.anpr_plate_fresh === null
+              ? null
+              : asBool(rawIn.anpr_plate_fresh, false)
+          )
+        : asBool(body.anpr_plate_fresh, false);
+
     const raw_json = {
       ...rawIn,
       source: "routes/v1/scanner_windows.js",
       scanner_id,
       camera_id,
-      observed_plate: plate || null,
+      observed_plate: plate,
+      plate_association,
+      plate_hint_age_ms,
+      anpr_plate_hint,
+      anpr_plate_fresh,
       ble_packets_seen,
       ble_devices_seen,
       companyid_hits_seen,
@@ -111,10 +140,14 @@ router.post("/", requireAuth, async (req, res) => {
         valid_uuid_seen,
         valid_sig_seen,
         valid_chal_seen,
-        pk_match_seen
+        pk_match_seen,
+        plate_association,
+        plate_hint_age_ms,
+        anpr_plate_hint,
+        anpr_plate_fresh
       )
       VALUES (
-        $1,$2::timestamptz,$3::timestamptz,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16
+        $1,$2::timestamptz,$3::timestamptz,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
       )
       RETURNING id, created_at
     `;
@@ -130,12 +163,16 @@ router.post("/", requireAuth, async (req, res) => {
       strongest_rssi,
       nearest_est_distance_m,
       JSON.stringify(raw_json),
-      plate || null,
+      plate,
       camera_id,
       valid_uuid_seen,
       valid_sig_seen,
       valid_chal_seen,
-      pk_match_seen
+      pk_match_seen,
+      plate_association,
+      plate_hint_age_ms,
+      anpr_plate_hint,
+      anpr_plate_fresh
     ];
 
     const result = await query(sql, params);
