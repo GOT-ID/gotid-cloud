@@ -11,6 +11,7 @@ import anprRoute from "./routes/v1/anpr.js";
 import aiRoute from "./routes/v1/ai.js";
 import fusionRoute from "./routes/v1/fusion.js";
 import scannerWindowsRoute from "./routes/v1/scanner_windows.js";
+import tamperRoutes from "./routes/v1/tamper.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.resolve(path.dirname(__filename));
@@ -77,6 +78,7 @@ app.use("/v1/anpr", anprRoute);
 app.use("/v1/ai", aiRoute);
 app.use("/v1/fusion", fusionRoute);
 app.use("/v1/scanner-windows", scannerWindowsRoute);
+app.use("/v1/tamper", tamperRoutes);
 
 // ----------------------------------------------
 // 404 FALLBACK
