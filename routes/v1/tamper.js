@@ -38,7 +38,6 @@ router.post("/remediate", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_pubkey_hex" });
     }
 
-    // record immutable remediation action
     await query(
       `
       INSERT INTO tamper_remediations (
@@ -53,7 +52,6 @@ router.post("/remediate", requireAuth, async (req, res) => {
       [pubkey_hex, workshop_id, technician_id, notes]
     );
 
-    // update persistent security state
     await query(
       `
       INSERT INTO device_security_state (
@@ -121,6 +119,90 @@ router.post("/remediate", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("tamper remediate error:", err);
     return res.status(500).json({ ok: false, error: "tamper_remediation_failed" });
+  }
+});
+
+/**
+ * POST /v1/tamper/release-hold
+ * Body:
+ * {
+ *   "pubkey_hex": "...",
+ *   "officer_id": "OFF-001",
+ *   "notes": "Replay hold reviewed and released by authorised officer"
+ * }
+ */
+router.post("/release-hold", requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const pubkey_hex = normHex(asStr(body.pubkey_hex, 300, "") || "");
+    const officer_id = asStr(body.officer_id, 128, null);
+    const notes = asStr(body.notes, 4000, null);
+
+    if (!pubkey_hex) {
+      return res.status(400).json({ ok: false, error: "missing_pubkey_hex" });
+    }
+
+    if (!officer_id) {
+      return res.status(400).json({ ok: false, error: "missing_officer_id" });
+    }
+
+    if (!notes) {
+      return res.status(400).json({ ok: false, error: "missing_notes" });
+    }
+
+    await query(
+      `
+      INSERT INTO tamper_clear_actions (
+        pubkey_hex,
+        officer_id,
+        notes,
+        created_at
+      )
+      VALUES ($1,$2,$3,NOW())
+      `,
+      [pubkey_hex, officer_id, notes]
+    );
+
+    await query(
+      `
+      UPDATE device_security_state
+      SET
+        current_state = 'REMEDIATED_PENDING_REVERIFY',
+        hold_flag = FALSE,
+        escalation_reason = NULL,
+        updated_at = NOW()
+      WHERE pubkey_hex = $1
+      `,
+      [pubkey_hex]
+    );
+
+    const stateRes = await query(
+      `
+      SELECT
+        pubkey_hex,
+        current_state,
+        tamper_count,
+        hold_flag,
+        escalation_reason,
+        last_remediation_at,
+        last_clear_at,
+        updated_at
+      FROM device_security_state
+      WHERE pubkey_hex = $1
+      LIMIT 1
+      `,
+      [pubkey_hex]
+    );
+
+    return res.json({
+      ok: true,
+      hold_released: true,
+      state: stateRes.rows[0] || null
+    });
+  } catch (err) {
+    console.error("tamper release-hold error:", err);
+    return res.status(500).json({ ok: false, error: "tamper_release_hold_failed" });
   }
 });
 
