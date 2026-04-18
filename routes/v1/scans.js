@@ -254,46 +254,50 @@ router.post("/", requireAuth, async (req, res) => {
 
     // ---- 1) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
-      INSERT INTO scan_events (
-        ver,
-        flags,
-        uuid,
-        counter,
-        sig_valid,
-        chal_valid,
-        tamper_flag,
-        result,
-        plate,
-        vin,
-        make,
-        model,
-        colour,
-        rssi,
-        est_distance_m,
-        gps_lat,
-        gps_lon,
-        scanner_id,
-        officer_id,
-        raw_json,
-        pubkey_hex,
-        tamper_state_observed,
-        tamper_live,
-        tamper_latched,
-        tamper_count,
-        tamper_event_sig_valid,
-        tamper_event_hex,
-        tamper_event_sig_hex,
-        challenge_hash,
-        evidence_hash
-      )
-      VALUES (
-        1,
-        0,
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-        $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29
-      )
-      RETURNING id, created_at;
-    `;
+  INSERT INTO scan_events (
+    ver,
+    flags,
+    uuid,
+    counter,
+    sig_valid,
+    chal_valid,
+    tamper_flag,
+    result,
+    plate,
+    vin,
+    make,
+    model,
+    colour,
+    rssi,
+    est_distance_m,
+    gps_lat,
+    gps_lon,
+    scanner_id,
+    officer_id,
+    raw_json,
+    pubkey_hex,
+    tamper_state_observed,
+    tamper_live,
+    tamper_latched,
+    tamper_count,
+    tamper_event_sig_valid,
+    tamper_event_hex,
+    tamper_event_sig_hex,
+    challenge_hash,
+    evidence_hash
+  )
+  VALUES (
+    1,
+    0,
+    $1,  $2,  $3,  $4,  $5,
+    $6,  $7,  $8,  $9,  $10,
+    $11, $12, $13, $14, $15,
+    $16, $17, $18, $19, $20,
+    $21, $22, $23, $24, $25,
+    $26, $27, $28
+  )
+  RETURNING id, created_at;
+`;
 
     const insertParams = [
       uuid,
