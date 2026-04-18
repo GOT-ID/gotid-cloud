@@ -372,16 +372,25 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-    // ---- 3) Upsert persistent device security state ----
+     // ---- 3) Upsert persistent device security state ----
     if (observedPubkeyHex) {
+      const replayOrCloneEvent =
+        scanner_result === "REPLAY_SUSPECT" ||
+        scanner_result === "CLONE_SUSPECT" ||
+        scanner_result === "MISMATCH_PUBKEY";
+
+      const tamperEvent =
+        tamper_live === true || tamper_latched === true;
+
       const cleanAuthenticScan =
+        (scanner_result === "AUTHENTIC" ||
+         scanner_result === "MATCH" ||
+         scanner_result === "DUPLICATE_OBSERVATION_ROTATION_SAFE") &&
         sig_valid === true &&
         chal_valid === true &&
         tamper_live === false &&
         tamper_latched === false &&
-        scanner_result !== "REPLAY_SUSPECT" &&
-        scanner_result !== "CLONE_SUSPECT" &&
-        scanner_result !== "MISMATCH_PUBKEY";
+        !replayOrCloneEvent;
 
       const stateLookup = await query(
         `
@@ -395,31 +404,43 @@ router.post("/", requireAuth, async (req, res) => {
 
       const existingState = stateLookup.rows[0] || null;
 
-      let nextState = "SECURE";
-      let holdFlag = false;
-      let escalationReason = null;
+      let nextState = existingState?.current_state || "SECURE";
+      let holdFlag = existingState?.hold_flag === true;
+      let escalationReason = existingState?.escalation_reason || null;
 
-      if (tamper_live || tamper_latched) {
-        nextState = "TAMPER_LATCHED";
-      }
+      const wasPendingReverify =
+        existingState?.current_state === "REMEDIATED_PENDING_REVERIFY";
 
-      if (
-        scanner_result === "REPLAY_SUSPECT" ||
-        scanner_result === "CLONE_SUSPECT" ||
-        scanner_result === "MISMATCH_PUBKEY"
-      ) {
+      const stillHeld =
+        existingState?.current_state === "ESCALATED_HOLD" &&
+        existingState?.hold_flag === true;
+
+      // 1) strongest current-event truth first
+      if (replayOrCloneEvent) {
         nextState = "ESCALATED_HOLD";
         holdFlag = true;
         escalationReason = scanner_result;
+      } else if (tamperEvent) {
+        nextState = "TAMPER_LATCHED";
+        holdFlag = false;
+        escalationReason = null;
+      } else if (stillHeld) {
+        // hold remains until manual release-hold route clears it
+        nextState = "ESCALATED_HOLD";
+        holdFlag = true;
+        escalationReason = existingState?.escalation_reason || "REPLAY_SUSPECT";
+      } else if (wasPendingReverify && cleanAuthenticScan) {
+        nextState = "SECURE";
+        holdFlag = false;
+        escalationReason = null;
+      } else if (cleanAuthenticScan) {
+        nextState = "SECURE";
+        holdFlag = false;
+        escalationReason = null;
       }
 
-      if (
-        existingState &&
-        existingState.current_state === "REMEDIATED_PENDING_REVERIFY" &&
-        cleanAuthenticScan
-      ) {
-        nextState = "CLEARED_VERIFIED";
-      }
+      const shouldSetLastTamperAt = tamperEvent;
+      const shouldSetLastClearAt = wasPendingReverify && cleanAuthenticScan;
 
       await query(
         `
@@ -449,12 +470,7 @@ router.post("/", requireAuth, async (req, res) => {
         )
         ON CONFLICT (pubkey_hex)
         DO UPDATE SET
-          current_state = CASE
-            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
-                 AND EXCLUDED.current_state <> 'ESCALATED_HOLD'
-              THEN device_security_state.current_state
-            ELSE EXCLUDED.current_state
-          END,
+          current_state = EXCLUDED.current_state,
           tamper_count = GREATEST(
             COALESCE(device_security_state.tamper_count, 0),
             COALESCE(EXCLUDED.tamper_count, 0)
@@ -469,22 +485,16 @@ router.post("/", requireAuth, async (req, res) => {
             ELSE device_security_state.last_clear_at
           END,
           last_scan_event_id = EXCLUDED.last_scan_event_id,
-          hold_flag = CASE
-            WHEN EXCLUDED.current_state = 'CLEARED_VERIFIED' THEN FALSE
-            ELSE COALESCE(device_security_state.hold_flag, false) OR EXCLUDED.hold_flag
-          END,
-          escalation_reason = CASE
-            WHEN EXCLUDED.current_state = 'CLEARED_VERIFIED' THEN NULL
-            ELSE COALESCE(device_security_state.escalation_reason, EXCLUDED.escalation_reason)
-          END,
+          hold_flag = EXCLUDED.hold_flag,
+          escalation_reason = EXCLUDED.escalation_reason,
           updated_at = NOW()
         `,
         [
           observedPubkeyHex,
           nextState,
           tamper_count,
-          tamper_live || tamper_latched,
-          nextState === "CLEARED_VERIFIED",
+          shouldSetLastTamperAt,
+          shouldSetLastClearAt,
           scanRow.id,
           holdFlag,
           escalationReason
