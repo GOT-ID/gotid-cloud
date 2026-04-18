@@ -374,6 +374,27 @@ router.post("/", requireAuth, async (req, res) => {
 
     // ---- 3) Upsert persistent device security state ----
     if (observedPubkeyHex) {
+      const cleanAuthenticScan =
+        sig_valid === true &&
+        chal_valid === true &&
+        tamper_live === false &&
+        tamper_latched === false &&
+        scanner_result !== "REPLAY_SUSPECT" &&
+        scanner_result !== "CLONE_SUSPECT" &&
+        scanner_result !== "MISMATCH_PUBKEY";
+
+      const stateLookup = await query(
+        `
+        SELECT *
+        FROM device_security_state
+        WHERE pubkey_hex = $1
+        LIMIT 1
+        `,
+        [observedPubkeyHex]
+      );
+
+      const existingState = stateLookup.rows[0] || null;
+
       let nextState = "SECURE";
       let holdFlag = false;
       let escalationReason = null;
@@ -392,6 +413,14 @@ router.post("/", requireAuth, async (req, res) => {
         escalationReason = scanner_result;
       }
 
+      if (
+        existingState &&
+        existingState.current_state === "REMEDIATED_PENDING_REVERIFY" &&
+        cleanAuthenticScan
+      ) {
+        nextState = "CLEARED_VERIFIED";
+      }
+
       await query(
         `
         INSERT INTO device_security_state (
@@ -400,20 +429,29 @@ router.post("/", requireAuth, async (req, res) => {
           tamper_count,
           last_seen_at,
           last_tamper_at,
+          last_clear_at,
           last_scan_event_id,
           hold_flag,
           escalation_reason,
           updated_at
         )
         VALUES (
-          $1,$2,$3,NOW(),
+          $1,
+          $2,
+          $3,
+          NOW(),
           CASE WHEN $4 THEN NOW() ELSE NULL END,
-          $5,$6,$7,NOW()
+          CASE WHEN $5 THEN NOW() ELSE NULL END,
+          $6,
+          $7,
+          $8,
+          NOW()
         )
         ON CONFLICT (pubkey_hex)
         DO UPDATE SET
           current_state = CASE
             WHEN device_security_state.current_state = 'ESCALATED_HOLD'
+                 AND EXCLUDED.current_state <> 'ESCALATED_HOLD'
               THEN device_security_state.current_state
             ELSE EXCLUDED.current_state
           END,
@@ -426,12 +464,19 @@ router.post("/", requireAuth, async (req, res) => {
             WHEN $4 THEN NOW()
             ELSE device_security_state.last_tamper_at
           END,
+          last_clear_at = CASE
+            WHEN $5 THEN NOW()
+            ELSE device_security_state.last_clear_at
+          END,
           last_scan_event_id = EXCLUDED.last_scan_event_id,
-          hold_flag = COALESCE(device_security_state.hold_flag, false) OR EXCLUDED.hold_flag,
-          escalation_reason = COALESCE(
-            device_security_state.escalation_reason,
-            EXCLUDED.escalation_reason
-          ),
+          hold_flag = CASE
+            WHEN EXCLUDED.current_state = 'CLEARED_VERIFIED' THEN FALSE
+            ELSE COALESCE(device_security_state.hold_flag, false) OR EXCLUDED.hold_flag
+          END,
+          escalation_reason = CASE
+            WHEN EXCLUDED.current_state = 'CLEARED_VERIFIED' THEN NULL
+            ELSE COALESCE(device_security_state.escalation_reason, EXCLUDED.escalation_reason)
+          END,
           updated_at = NOW()
         `,
         [
@@ -439,6 +484,7 @@ router.post("/", requireAuth, async (req, res) => {
           nextState,
           tamper_count,
           tamper_live || tamper_latched,
+          nextState === "CLEARED_VERIFIED",
           scanRow.id,
           holdFlag,
           escalationReason
