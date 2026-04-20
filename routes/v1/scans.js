@@ -379,16 +379,14 @@ router.post("/", requireAuth, async (req, res) => {
         scanner_result === "CLONE_SUSPECT" ||
         scanner_result === "MISMATCH_PUBKEY";
 
-      // IMPORTANT:
       // Live tamper means a current physical tamper condition right now.
       // Historical latched tamper remains preserved in tamper history/state,
       // but must not permanently block post-remediation reverify.
       const tamperEvent = tamper_live === true;
 
+      // For remediation reverify, trust raw cryptographic + live tamper facts,
+      // not the scanner's historical/latched result label.
       const cleanAuthenticScan =
-        (scanner_result === "AUTHENTIC" ||
-         scanner_result === "MATCH" ||
-         scanner_result === "DUPLICATE_OBSERVATION_ROTATION_SAFE") &&
         sig_valid === true &&
         chal_valid === true &&
         tamper_live === false &&
@@ -417,7 +415,7 @@ router.post("/", requireAuth, async (req, res) => {
         existingState?.current_state === "ESCALATED_HOLD" &&
         existingState?.hold_flag === true;
 
-      // 1) strongest current-event truth first
+      // strongest current-event truth first
       if (replayOrCloneEvent) {
         nextState = "ESCALATED_HOLD";
         holdFlag = true;
@@ -427,7 +425,6 @@ router.post("/", requireAuth, async (req, res) => {
         holdFlag = false;
         escalationReason = null;
       } else if (stillHeld) {
-        // hold remains until manual release-hold route clears it
         nextState = "ESCALATED_HOLD";
         holdFlag = true;
         escalationReason = existingState?.escalation_reason || "REPLAY_SUSPECT";
