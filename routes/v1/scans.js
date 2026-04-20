@@ -372,15 +372,18 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-     // ---- 3) Upsert persistent device security state ----
+    // ---- 3) Upsert persistent device security state ----
     if (observedPubkeyHex) {
       const replayOrCloneEvent =
         scanner_result === "REPLAY_SUSPECT" ||
         scanner_result === "CLONE_SUSPECT" ||
         scanner_result === "MISMATCH_PUBKEY";
 
-      const tamperEvent =
-        tamper_live === true || tamper_latched === true;
+      // IMPORTANT:
+      // Live tamper means a current physical tamper condition right now.
+      // Historical latched tamper remains preserved in tamper history/state,
+      // but must not permanently block post-remediation reverify.
+      const tamperEvent = tamper_live === true;
 
       const cleanAuthenticScan =
         (scanner_result === "AUTHENTIC" ||
@@ -389,7 +392,6 @@ router.post("/", requireAuth, async (req, res) => {
         sig_valid === true &&
         chal_valid === true &&
         tamper_live === false &&
-        tamper_latched === false &&
         !replayOrCloneEvent;
 
       const stateLookup = await query(
