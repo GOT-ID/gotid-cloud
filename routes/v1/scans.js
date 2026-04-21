@@ -115,10 +115,6 @@ router.post("/", requireAuth, async (req, res) => {
     const scanner_result_in =
       (asStr(body.result ?? body.verdict, 32, "") || "").toUpperCase().trim();
 
-    // IMPORTANT:
-    // We now decide scanner_result after reading authoritative device_security_state.
-    let scanner_result = scanner_result_in || "UNKNOWN";
-
     const rssi =
       body.rssi === undefined || body.rssi === null
         ? null
@@ -156,7 +152,6 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
-    // ---- radio evidence preserved inside raw_json too ----
     const ble_packets_seen =
       body.ble_packets_seen === undefined || body.ble_packets_seen === null
         ? null
@@ -203,9 +198,8 @@ router.post("/", requireAuth, async (req, res) => {
       null
     );
 
-    // ---- 1) Read authoritative device state BEFORE deciding scanner_result ----
+    // Read authoritative device state BEFORE deciding result
     let existingState = null;
-
     if (observedPubkeyHex) {
       const stateLookup = await query(
         `
@@ -219,40 +213,30 @@ router.post("/", requireAuth, async (req, res) => {
       existingState = stateLookup.rows[0] || null;
     }
 
-    // ---- 2) Decide scanner_result using authoritative device state ----
-    if (!scanner_result_in || scanner_result_in === "UNKNOWN") {
-      if (tamper_live === true) {
-        scanner_result = "TAMPER_LATCHED";
-      } else if (existingState?.current_state === "REMEDIATED_PENDING_REVERIFY") {
-        scanner_result = "REMEDIATED_PENDING_REVERIFY";
-      } else if (existingState?.current_state === "ESCALATED_HOLD") {
-        scanner_result = existingState?.escalation_reason || "ESCALATED_HOLD";
-      } else if (existingState?.current_state === "SECURE") {
-        if (!sig_valid) {
-          scanner_result = "INVALID_TAG";
-        } else if (sig_valid && !chal_valid) {
-          scanner_result = "RELAY_SUSPECT";
-        } else if (sig_valid && chal_valid) {
-          scanner_result = "MATCH";
-        } else {
-          scanner_result = "UNKNOWN";
-        }
-      } else if (tamper_latched === true) {
-        scanner_result = "TAMPER_LATCHED";
-      } else if (!sig_valid) {
-        scanner_result = "INVALID_TAG";
-      } else if (sig_valid && !chal_valid) {
-        scanner_result = "RELAY_SUSPECT";
-      } else if (sig_valid && chal_valid) {
-        scanner_result = "MATCH";
-      } else {
-        scanner_result = "UNKNOWN";
-      }
+    // Backend is authoritative. Ignore scanner-supplied result for persisted result.
+    let scanner_result = "UNKNOWN";
+
+    if (tamper_live === true) {
+      scanner_result = "TAMPER_LATCHED";
+    } else if (existingState?.current_state === "REMEDIATED_PENDING_REVERIFY") {
+      scanner_result = "REMEDIATED_PENDING_REVERIFY";
+    } else if (existingState?.current_state === "ESCALATED_HOLD") {
+      scanner_result = existingState?.escalation_reason || "ESCALATED_HOLD";
+    } else if (!sig_valid) {
+      scanner_result = "INVALID_TAG";
+    } else if (sig_valid && !chal_valid) {
+      scanner_result = "RELAY_SUSPECT";
+    } else if (sig_valid && chal_valid) {
+      scanner_result = "MATCH";
+    } else if (tamper_latched === true && existingState?.current_state !== "SECURE") {
+      scanner_result = "TAMPER_LATCHED";
     }
 
     const raw = {
       ...rawIn,
       pubkey_hex: observedPubkeyHex || null,
+      scanner_result_in: scanner_result_in || null,
+      scanner_result,
       ble_packets_seen,
       ble_devices_seen,
       companyid_hits_seen,
@@ -261,7 +245,6 @@ router.post("/", requireAuth, async (req, res) => {
       valid_sig_seen,
       valid_chal_seen,
       pk_match_seen,
-      scanner_result,
       scanner_id,
       officer_id,
       camera_id,
@@ -285,7 +268,6 @@ router.post("/", requireAuth, async (req, res) => {
     const evidence_hash = sha256Hex(raw);
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
-    // ---- 3) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
   INSERT INTO scan_events (
     ver,
@@ -366,7 +348,6 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
-    // ---- 4) Append immutable tamper event history (if relevant) ----
     if (
       observedPubkeyHex ||
       tamper_live ||
@@ -405,20 +386,14 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-    // ---- 5) Upsert persistent device security state ----
     if (observedPubkeyHex) {
       const replayOrCloneEvent =
         scanner_result === "REPLAY_SUSPECT" ||
         scanner_result === "CLONE_SUSPECT" ||
         scanner_result === "MISMATCH_PUBKEY";
 
-      // Live tamper means a current physical tamper condition right now.
-      // Historical latched tamper remains preserved in tamper history/state,
-      // but must not permanently block post-remediation reverify.
       const tamperEvent = tamper_live === true;
 
-      // For remediation reverify, trust raw cryptographic + live tamper facts,
-      // not the scanner's historical/latched result label.
       const cleanAuthenticScan =
         sig_valid === true &&
         chal_valid === true &&
@@ -436,7 +411,6 @@ router.post("/", requireAuth, async (req, res) => {
         existingState?.current_state === "ESCALATED_HOLD" &&
         existingState?.hold_flag === true;
 
-      // strongest current-event truth first
       if (replayOrCloneEvent) {
         nextState = "ESCALATED_HOLD";
         holdFlag = true;
@@ -530,6 +504,7 @@ router.post("/", requireAuth, async (req, res) => {
       plate: observedPlate || null,
       has_identity,
       scanner_result,
+      scanner_result_in: scanner_result_in || null,
       tamper_state_observed,
       tamper_live,
       tamper_latched,
