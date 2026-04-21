@@ -152,6 +152,7 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
+    // ---- radio evidence preserved inside raw_json too ----
     const ble_packets_seen =
       body.ble_packets_seen === undefined || body.ble_packets_seen === null
         ? null
@@ -198,7 +199,7 @@ router.post("/", requireAuth, async (req, res) => {
       null
     );
 
-    // Read authoritative device state BEFORE deciding result
+    // ---- 1) Read existing device state before deciding truth ----
     let existingState = null;
     if (observedPubkeyHex) {
       const stateLookup = await query(
@@ -213,7 +214,7 @@ router.post("/", requireAuth, async (req, res) => {
       existingState = stateLookup.rows[0] || null;
     }
 
-    // Backend is authoritative. Ignore scanner-supplied result for persisted result.
+    // ---- 2) Backend decides truth. Incoming device claim is evidence only ----
     let scanner_result = "UNKNOWN";
 
     if (tamper_live === true) {
@@ -235,8 +236,6 @@ router.post("/", requireAuth, async (req, res) => {
     const raw = {
       ...rawIn,
       pubkey_hex: observedPubkeyHex || null,
-      scanner_result_in: scanner_result_in || null,
-      scanner_result,
       ble_packets_seen,
       ble_devices_seen,
       companyid_hits_seen,
@@ -245,6 +244,8 @@ router.post("/", requireAuth, async (req, res) => {
       valid_sig_seen,
       valid_chal_seen,
       pk_match_seen,
+      scanner_result_in: scanner_result_in || null,
+      scanner_result,
       scanner_id,
       officer_id,
       camera_id,
@@ -268,51 +269,48 @@ router.post("/", requireAuth, async (req, res) => {
     const evidence_hash = sha256Hex(raw);
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
+    // ---- 3) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
-  INSERT INTO scan_events (
-    ver,
-    flags,
-    uuid,
-    counter,
-    sig_valid,
-    chal_valid,
-    tamper_flag,
-    result,
-    plate,
-    vin,
-    make,
-    model,
-    colour,
-    rssi,
-    est_distance_m,
-    gps_lat,
-    gps_lon,
-    scanner_id,
-    officer_id,
-    raw_json,
-    pubkey_hex,
-    tamper_state_observed,
-    tamper_live,
-    tamper_latched,
-    tamper_count,
-    tamper_event_sig_valid,
-    tamper_event_hex,
-    tamper_event_sig_hex,
-    challenge_hash,
-    evidence_hash
-  )
-  VALUES (
-    1,
-    0,
-    $1,  $2,  $3,  $4,  $5,
-    $6,  $7,  $8,  $9,  $10,
-    $11, $12, $13, $14, $15,
-    $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25,
-    $26, $27, $28
-  )
-  RETURNING id, created_at;
-`;
+      INSERT INTO scan_events (
+        ver,
+        flags,
+        uuid,
+        counter,
+        sig_valid,
+        chal_valid,
+        tamper_flag,
+        result,
+        plate,
+        vin,
+        make,
+        model,
+        colour,
+        rssi,
+        est_distance_m,
+        gps_lat,
+        gps_lon,
+        scanner_id,
+        officer_id,
+        raw_json,
+        pubkey_hex,
+        tamper_state_observed,
+        tamper_live,
+        tamper_latched,
+        tamper_count,
+        tamper_event_sig_valid,
+        tamper_event_hex,
+        tamper_event_sig_hex,
+        challenge_hash,
+        evidence_hash
+      )
+      VALUES (
+        1,
+        0,
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+        $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29
+      )
+      RETURNING id, created_at;
+    `;
 
     const insertParams = [
       uuid,
@@ -348,6 +346,7 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
+    // ---- 4) Append immutable tamper event history (if relevant) ----
     if (
       observedPubkeyHex ||
       tamper_live ||
@@ -386,55 +385,33 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
+    // ---- 5) Upsert persistent device security state ----
     if (observedPubkeyHex) {
-      const replayOrCloneEvent =
-        scanner_result === "REPLAY_SUSPECT" ||
-        scanner_result === "CLONE_SUSPECT" ||
-        scanner_result === "MISMATCH_PUBKEY";
-
-      const tamperEvent = tamper_live === true;
-
-      const cleanAuthenticScan =
-        sig_valid === true &&
-        chal_valid === true &&
-        tamper_live === false &&
-        !replayOrCloneEvent;
-
       let nextState = existingState?.current_state || "SECURE";
       let holdFlag = existingState?.hold_flag === true;
       let escalationReason = existingState?.escalation_reason || null;
 
-      const wasPendingReverify =
-        existingState?.current_state === "REMEDIATED_PENDING_REVERIFY";
-
-      const stillHeld =
-        existingState?.current_state === "ESCALATED_HOLD" &&
-        existingState?.hold_flag === true;
-
-      if (replayOrCloneEvent) {
-        nextState = "ESCALATED_HOLD";
-        holdFlag = true;
-        escalationReason = scanner_result;
-      } else if (tamperEvent) {
+      // Only live tamper forces current tamper state.
+      if (tamper_live === true) {
         nextState = "TAMPER_LATCHED";
         holdFlag = false;
         escalationReason = null;
-      } else if (stillHeld) {
-        nextState = "ESCALATED_HOLD";
-        holdFlag = true;
-        escalationReason = existingState?.escalation_reason || "REPLAY_SUSPECT";
-      } else if (wasPendingReverify && cleanAuthenticScan) {
-        nextState = "SECURE";
-        holdFlag = false;
-        escalationReason = null;
-      } else if (cleanAuthenticScan) {
+      } else if (sig_valid === true && chal_valid === true) {
         nextState = "SECURE";
         holdFlag = false;
         escalationReason = null;
       }
 
-      const shouldSetLastTamperAt = tamperEvent;
-      const shouldSetLastClearAt = wasPendingReverify && cleanAuthenticScan;
+      // Replay/clone-style events still escalate and hold.
+      if (
+        scanner_result === "REPLAY_SUSPECT" ||
+        scanner_result === "CLONE_SUSPECT" ||
+        scanner_result === "MISMATCH_PUBKEY"
+      ) {
+        nextState = "ESCALATED_HOLD";
+        holdFlag = true;
+        escalationReason = scanner_result;
+      }
 
       await query(
         `
@@ -444,27 +421,24 @@ router.post("/", requireAuth, async (req, res) => {
           tamper_count,
           last_seen_at,
           last_tamper_at,
-          last_clear_at,
           last_scan_event_id,
           hold_flag,
           escalation_reason,
           updated_at
         )
         VALUES (
-          $1,
-          $2,
-          $3,
-          NOW(),
+          $1,$2,$3,NOW(),
           CASE WHEN $4 THEN NOW() ELSE NULL END,
-          CASE WHEN $5 THEN NOW() ELSE NULL END,
-          $6,
-          $7,
-          $8,
-          NOW()
+          $5,$6,$7,NOW()
         )
         ON CONFLICT (pubkey_hex)
         DO UPDATE SET
-          current_state = EXCLUDED.current_state,
+          current_state = CASE
+            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
+              AND COALESCE(device_security_state.hold_flag, false) = true
+              THEN device_security_state.current_state
+            ELSE EXCLUDED.current_state
+          END,
           tamper_count = GREATEST(
             COALESCE(device_security_state.tamper_count, 0),
             COALESCE(EXCLUDED.tamper_count, 0)
@@ -474,21 +448,26 @@ router.post("/", requireAuth, async (req, res) => {
             WHEN $4 THEN NOW()
             ELSE device_security_state.last_tamper_at
           END,
-          last_clear_at = CASE
-            WHEN $5 THEN NOW()
-            ELSE device_security_state.last_clear_at
-          END,
           last_scan_event_id = EXCLUDED.last_scan_event_id,
-          hold_flag = EXCLUDED.hold_flag,
-          escalation_reason = EXCLUDED.escalation_reason,
+          hold_flag = CASE
+            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
+              AND COALESCE(device_security_state.hold_flag, false) = true
+              THEN true
+            ELSE EXCLUDED.hold_flag
+          END,
+          escalation_reason = CASE
+            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
+              AND COALESCE(device_security_state.hold_flag, false) = true
+              THEN COALESCE(device_security_state.escalation_reason, EXCLUDED.escalation_reason)
+            ELSE EXCLUDED.escalation_reason
+          END,
           updated_at = NOW()
         `,
         [
           observedPubkeyHex,
           nextState,
           tamper_count,
-          shouldSetLastTamperAt,
-          shouldSetLastClearAt,
+          tamper_live === true,
           scanRow.id,
           holdFlag,
           escalationReason
