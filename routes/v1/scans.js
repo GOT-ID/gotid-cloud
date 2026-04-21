@@ -115,23 +115,9 @@ router.post("/", requireAuth, async (req, res) => {
     const scanner_result_in =
       (asStr(body.result ?? body.verdict, 32, "") || "").toUpperCase().trim();
 
-    let scanner_result = scanner_result_in;
-
-    if (!scanner_result || scanner_result === "UNKNOWN") {
-      if (tamper_live) {
-        scanner_result = "TAMPERED";
-      } else if (tamper_latched) {
-        scanner_result = "TAMPER_LATCHED";
-      } else if (!sig_valid) {
-        scanner_result = "INVALID_TAG";
-      } else if (sig_valid && !chal_valid) {
-        scanner_result = "RELAY_SUSPECT";
-      } else if (sig_valid && chal_valid) {
-        scanner_result = "MATCH";
-      } else {
-        scanner_result = "UNKNOWN";
-      }
-    }
+    // IMPORTANT:
+    // We now decide scanner_result after reading authoritative device_security_state.
+    let scanner_result = scanner_result_in || "UNKNOWN";
 
     const rssi =
       body.rssi === undefined || body.rssi === null
@@ -217,6 +203,53 @@ router.post("/", requireAuth, async (req, res) => {
       null
     );
 
+    // ---- 1) Read authoritative device state BEFORE deciding scanner_result ----
+    let existingState = null;
+
+    if (observedPubkeyHex) {
+      const stateLookup = await query(
+        `
+        SELECT *
+        FROM device_security_state
+        WHERE pubkey_hex = $1
+        LIMIT 1
+        `,
+        [observedPubkeyHex]
+      );
+      existingState = stateLookup.rows[0] || null;
+    }
+
+    // ---- 2) Decide scanner_result using authoritative device state ----
+    if (!scanner_result_in || scanner_result_in === "UNKNOWN") {
+      if (tamper_live === true) {
+        scanner_result = "TAMPER_LATCHED";
+      } else if (existingState?.current_state === "REMEDIATED_PENDING_REVERIFY") {
+        scanner_result = "REMEDIATED_PENDING_REVERIFY";
+      } else if (existingState?.current_state === "ESCALATED_HOLD") {
+        scanner_result = existingState?.escalation_reason || "ESCALATED_HOLD";
+      } else if (existingState?.current_state === "SECURE") {
+        if (!sig_valid) {
+          scanner_result = "INVALID_TAG";
+        } else if (sig_valid && !chal_valid) {
+          scanner_result = "RELAY_SUSPECT";
+        } else if (sig_valid && chal_valid) {
+          scanner_result = "MATCH";
+        } else {
+          scanner_result = "UNKNOWN";
+        }
+      } else if (tamper_latched === true) {
+        scanner_result = "TAMPER_LATCHED";
+      } else if (!sig_valid) {
+        scanner_result = "INVALID_TAG";
+      } else if (sig_valid && !chal_valid) {
+        scanner_result = "RELAY_SUSPECT";
+      } else if (sig_valid && chal_valid) {
+        scanner_result = "MATCH";
+      } else {
+        scanner_result = "UNKNOWN";
+      }
+    }
+
     const raw = {
       ...rawIn,
       pubkey_hex: observedPubkeyHex || null,
@@ -252,7 +285,7 @@ router.post("/", requireAuth, async (req, res) => {
     const evidence_hash = sha256Hex(raw);
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
-    // ---- 1) Insert scan_events (forensic identity-hit record) ----
+    // ---- 3) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
   INSERT INTO scan_events (
     ver,
@@ -333,7 +366,7 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
-    // ---- 2) Append immutable tamper event history (if relevant) ----
+    // ---- 4) Append immutable tamper event history (if relevant) ----
     if (
       observedPubkeyHex ||
       tamper_live ||
@@ -372,7 +405,7 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-    // ---- 3) Upsert persistent device security state ----
+    // ---- 5) Upsert persistent device security state ----
     if (observedPubkeyHex) {
       const replayOrCloneEvent =
         scanner_result === "REPLAY_SUSPECT" ||
@@ -391,18 +424,6 @@ router.post("/", requireAuth, async (req, res) => {
         chal_valid === true &&
         tamper_live === false &&
         !replayOrCloneEvent;
-
-      const stateLookup = await query(
-        `
-        SELECT *
-        FROM device_security_state
-        WHERE pubkey_hex = $1
-        LIMIT 1
-        `,
-        [observedPubkeyHex]
-      );
-
-      const existingState = stateLookup.rows[0] || null;
 
       let nextState = existingState?.current_state || "SECURE";
       let holdFlag = existingState?.hold_flag === true;
