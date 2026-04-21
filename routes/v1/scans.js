@@ -115,6 +115,21 @@ router.post("/", requireAuth, async (req, res) => {
     const scanner_result_in =
       (asStr(body.result ?? body.verdict, 32, "") || "").toUpperCase().trim();
 
+    // CHANGE 1: backend decides the final truth, incoming result is evidence only
+    let scanner_result = "UNKNOWN";
+
+    if (tamper_live === true) {
+      scanner_result = "TAMPER_LATCHED";
+    } else if (!sig_valid) {
+      scanner_result = "INVALID_TAG";
+    } else if (sig_valid && !chal_valid) {
+      scanner_result = "RELAY_SUSPECT";
+    } else if (sig_valid && chal_valid) {
+      scanner_result = "MATCH";
+    } else if (tamper_latched === true) {
+      scanner_result = "TAMPER_LATCHED";
+    }
+
     const rssi =
       body.rssi === undefined || body.rssi === null
         ? null
@@ -199,40 +214,6 @@ router.post("/", requireAuth, async (req, res) => {
       null
     );
 
-    // ---- 1) Read existing device state before deciding truth ----
-    let existingState = null;
-    if (observedPubkeyHex) {
-      const stateLookup = await query(
-        `
-        SELECT *
-        FROM device_security_state
-        WHERE pubkey_hex = $1
-        LIMIT 1
-        `,
-        [observedPubkeyHex]
-      );
-      existingState = stateLookup.rows[0] || null;
-    }
-
-    // ---- 2) Backend decides truth. Incoming device claim is evidence only ----
-    let scanner_result = "UNKNOWN";
-
-    if (tamper_live === true) {
-      scanner_result = "TAMPER_LATCHED";
-    } else if (existingState?.current_state === "REMEDIATED_PENDING_REVERIFY") {
-      scanner_result = "REMEDIATED_PENDING_REVERIFY";
-    } else if (existingState?.current_state === "ESCALATED_HOLD") {
-      scanner_result = existingState?.escalation_reason || "ESCALATED_HOLD";
-    } else if (!sig_valid) {
-      scanner_result = "INVALID_TAG";
-    } else if (sig_valid && !chal_valid) {
-      scanner_result = "RELAY_SUSPECT";
-    } else if (sig_valid && chal_valid) {
-      scanner_result = "MATCH";
-    } else if (tamper_latched === true && existingState?.current_state !== "SECURE") {
-      scanner_result = "TAMPER_LATCHED";
-    }
-
     const raw = {
       ...rawIn,
       pubkey_hex: observedPubkeyHex || null,
@@ -244,6 +225,7 @@ router.post("/", requireAuth, async (req, res) => {
       valid_sig_seen,
       valid_chal_seen,
       pk_match_seen,
+      // CHANGE 2: preserve incoming claim separately
       scanner_result_in: scanner_result_in || null,
       scanner_result,
       scanner_id,
@@ -269,7 +251,7 @@ router.post("/", requireAuth, async (req, res) => {
     const evidence_hash = sha256Hex(raw);
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
-    // ---- 3) Insert scan_events (forensic identity-hit record) ----
+    // ---- 1) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
       INSERT INTO scan_events (
         ver,
@@ -346,7 +328,7 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
-    // ---- 4) Append immutable tamper event history (if relevant) ----
+    // ---- 2) Append immutable tamper event history (if relevant) ----
     if (
       observedPubkeyHex ||
       tamper_live ||
@@ -385,24 +367,19 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-    // ---- 5) Upsert persistent device security state ----
+    // ---- 3) Upsert persistent device security state ----
     if (observedPubkeyHex) {
-      let nextState = existingState?.current_state || "SECURE";
-      let holdFlag = existingState?.hold_flag === true;
-      let escalationReason = existingState?.escalation_reason || null;
+      let nextState = "SECURE";
+      let holdFlag = false;
+      let escalationReason = null;
 
-      // Only live tamper forces current tamper state.
-      if (tamper_live === true) {
+      // CHANGE 3: only LIVE tamper forces current TAMPER_LATCHED
+      if (tamper_live) {
         nextState = "TAMPER_LATCHED";
-        holdFlag = false;
-        escalationReason = null;
-      } else if (sig_valid === true && chal_valid === true) {
+      } else if (sig_valid && chal_valid) {
         nextState = "SECURE";
-        holdFlag = false;
-        escalationReason = null;
       }
 
-      // Replay/clone-style events still escalate and hold.
       if (
         scanner_result === "REPLAY_SUSPECT" ||
         scanner_result === "CLONE_SUSPECT" ||
@@ -435,7 +412,6 @@ router.post("/", requireAuth, async (req, res) => {
         DO UPDATE SET
           current_state = CASE
             WHEN device_security_state.current_state = 'ESCALATED_HOLD'
-              AND COALESCE(device_security_state.hold_flag, false) = true
               THEN device_security_state.current_state
             ELSE EXCLUDED.current_state
           END,
@@ -449,25 +425,18 @@ router.post("/", requireAuth, async (req, res) => {
             ELSE device_security_state.last_tamper_at
           END,
           last_scan_event_id = EXCLUDED.last_scan_event_id,
-          hold_flag = CASE
-            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
-              AND COALESCE(device_security_state.hold_flag, false) = true
-              THEN true
-            ELSE EXCLUDED.hold_flag
-          END,
-          escalation_reason = CASE
-            WHEN device_security_state.current_state = 'ESCALATED_HOLD'
-              AND COALESCE(device_security_state.hold_flag, false) = true
-              THEN COALESCE(device_security_state.escalation_reason, EXCLUDED.escalation_reason)
-            ELSE EXCLUDED.escalation_reason
-          END,
+          hold_flag = COALESCE(device_security_state.hold_flag, false) OR EXCLUDED.hold_flag,
+          escalation_reason = COALESCE(
+            device_security_state.escalation_reason,
+            EXCLUDED.escalation_reason
+          ),
           updated_at = NOW()
         `,
         [
           observedPubkeyHex,
           nextState,
           tamper_count,
-          tamper_live === true,
+          tamper_live, // was: tamper_live || tamper_latched
           scanRow.id,
           holdFlag,
           escalationReason
