@@ -65,7 +65,7 @@ router.post("/", requireAuth, async (req, res) => {
   const body = req.body || {};
 
   try {
-    // ---- 0) Validate + normalise payload (production hygiene) ----
+    // ---- 0) Validate + normalise payload ----
     const rawIn = asObj(body.raw_json);
 
     const observedPlate = normPlate(asStr(body.plate, MAX_PLATE_LEN, "") || "");
@@ -115,7 +115,12 @@ router.post("/", requireAuth, async (req, res) => {
     const scanner_result_in =
       (asStr(body.result ?? body.verdict, 32, "") || "").toUpperCase().trim();
 
-    // CHANGE 1: backend decides the final truth, incoming result is evidence only
+    const pk_match_seen =
+      body.pk_match_seen === undefined || body.pk_match_seen === null
+        ? asBool(rawIn.pk_match_seen ?? rawIn.pubkey_match, false)
+        : asBool(body.pk_match_seen, false);
+
+    // Backend final verdict rule
     let scanner_result = "UNKNOWN";
 
     if (tamper_live === true) {
@@ -124,7 +129,9 @@ router.post("/", requireAuth, async (req, res) => {
       scanner_result = "INVALID_TAG";
     } else if (sig_valid && !chal_valid) {
       scanner_result = "RELAY_SUSPECT";
-    } else if (sig_valid && chal_valid) {
+    } else if (sig_valid && chal_valid && pk_match_seen === false) {
+      scanner_result = "CLONE_SUSPECT";
+    } else if (sig_valid && chal_valid && pk_match_seen === true) {
       scanner_result = "MATCH";
     } else if (tamper_latched === true) {
       scanner_result = "TAMPER_LATCHED";
@@ -167,7 +174,6 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "pubkey_hex malformed (non-hex)" });
     }
 
-    // ---- radio evidence preserved inside raw_json too ----
     const ble_packets_seen =
       body.ble_packets_seen === undefined || body.ble_packets_seen === null
         ? null
@@ -203,11 +209,6 @@ router.post("/", requireAuth, async (req, res) => {
         ? chal_valid === true
         : asBool(body.valid_chal_seen, false);
 
-    const pk_match_seen =
-      body.pk_match_seen === undefined || body.pk_match_seen === null
-        ? false
-        : asBool(body.pk_match_seen, false);
-
     const challenge_hash = asStr(
       body.challenge_hash ?? rawIn.challenge_hash,
       128,
@@ -225,7 +226,6 @@ router.post("/", requireAuth, async (req, res) => {
       valid_sig_seen,
       valid_chal_seen,
       pk_match_seen,
-      // CHANGE 2: preserve incoming claim separately
       scanner_result_in: scanner_result_in || null,
       scanner_result,
       scanner_id,
@@ -251,7 +251,6 @@ router.post("/", requireAuth, async (req, res) => {
     const evidence_hash = sha256Hex(raw);
     const has_identity = !!observedPubkeyHex && sig_valid === true;
 
-    // ---- 1) Insert scan_events (forensic identity-hit record) ----
     const insertSql = `
       INSERT INTO scan_events (
         ver,
@@ -285,12 +284,12 @@ router.post("/", requireAuth, async (req, res) => {
         challenge_hash,
         evidence_hash
       )
-     VALUES (
-  1,
-  0,
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-  $19,$20,$21,$22,$23,$24,$25,$26,$27,$28
-)
+      VALUES (
+        1,
+        0,
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+        $19,$20,$21,$22,$23,$24,$25,$26,$27,$28
+      )
       RETURNING id, created_at;
     `;
 
@@ -328,7 +327,6 @@ router.post("/", requireAuth, async (req, res) => {
     const insertRes = await query(insertSql, insertParams);
     const scanRow = insertRes.rows[0];
 
-    // ---- 2) Append immutable tamper event history (if relevant) ----
     if (
       observedPubkeyHex ||
       tamper_live ||
@@ -367,13 +365,11 @@ router.post("/", requireAuth, async (req, res) => {
       );
     }
 
-    // ---- 3) Upsert persistent device security state ----
     if (observedPubkeyHex) {
       let nextState = "SECURE";
       let holdFlag = false;
       let escalationReason = null;
 
-      // CHANGE 3: only LIVE tamper forces current TAMPER_LATCHED
       if (tamper_live) {
         nextState = "TAMPER_LATCHED";
       } else if (sig_valid && chal_valid) {
@@ -436,7 +432,7 @@ router.post("/", requireAuth, async (req, res) => {
           observedPubkeyHex,
           nextState,
           tamper_count,
-          tamper_live, // was: tamper_live || tamper_latched
+          tamper_live,
           scanRow.id,
           holdFlag,
           escalationReason
